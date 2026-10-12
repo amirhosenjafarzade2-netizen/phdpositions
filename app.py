@@ -336,109 +336,168 @@ POSTDOC_RE = re.compile(r"post[\s-]?doc|postdoctoral|professor|lecturer|assistan
 
 
 def build_query(site: Site, kws, mode, add_phd):
-    quoted = [f'"{k}"' for k in kws]
-    kw_part = ("(" + " OR ".join(quoted) + ")") if (len(quoted) > 1 and mode == "any") else " ".join(quoted)
+    """Build a search-engine-friendly query without forcing PhD terms when disabled."""
+    quoted = [f'"{k.strip()}"' for k in kws if k.strip()]
+    if len(quoted) > 1 and mode == "any":
+        kw_part = "(" + " OR ".join(quoted) + ")"
+    else:
+        # In ALL mode, requiring each phrase is intentional.
+        kw_part = " ".join(quoted)
     parts = []
     if site.query:
-        parts.append(f"site:{site.query}")
-    if add_phd or not site.query:
+        # Use the host for the main query. URL paths are inconsistent in search indexes.
+        host = site.query.split("/")[0].strip()
+        if host:
+            parts.append(f"site:{host}")
+    if add_phd:
         parts.append(PHD_TERMS)
-    parts.append(kw_part)
-    return " ".join(p for p in parts if p)
+    if kw_part:
+        parts.append(kw_part)
+    return " ".join(parts)
 
 
 def _patch_ddgs_google():
-    """ddgs' Google backend adds cr=countryUS & lr=lang_en, which hides every non-US/non-English site
-    (jobbnorge.no, .nl, .ac.uk ...). Remove those two restrictions."""
+    """Remove accidental US/English-only restrictions from ddgs' Google payload, if supported."""
     try:
         from ddgs.engines.google import Google
-        orig = Google.build_payload
-        if getattr(orig, "_patched", False):
+        orig = getattr(Google, "build_payload", None)
+        if not orig or getattr(orig, "_phdfinder_patched", False):
             return
 
-        def build_payload(self, *a, **k):
-            pl = orig(self, *a, **k)
-            pl.pop("cr", None)
-            pl.pop("lr", None)
-            return pl
-        build_payload._patched = True
+        def build_payload(self, *args, **kwargs):
+            payload = orig(self, *args, **kwargs)
+            if isinstance(payload, dict):
+                payload.pop("cr", None)
+                payload.pop("lr", None)
+            return payload
+
+        build_payload._phdfinder_patched = True
         Google.build_payload = build_payload
     except Exception:
+        # Different ddgs versions have different internals; search must still work without this patch.
         pass
+
+
+def available_text_backends():
+    """Return backend names supported by the installed ddgs version."""
+    try:
+        from ddgs.engines import ENGINES
+        names = ENGINES.get("text", {})
+        return set(names.keys() if isinstance(names, dict) else names)
+    except Exception:
+        # Let DDGS itself validate names on versions that don't expose ENGINES.
+        return set()
 
 
 def search_engine(q, n, backend):
-    """Query ONE explicit ddgs backend. Never use 'auto': it puts Wikipedia/Grokipedia first and
-    those engines ignore site: operators, so real job pages get crowded out."""
+    """Run one explicit ddgs text backend and normalize its result format."""
     try:
         from ddgs import DDGS
-    except ImportError:
-        raise RuntimeError("Package 'ddgs' is missing or too old: pip install -U ddgs")
+    except ImportError as exc:
+        raise RuntimeError("Package 'ddgs' is missing. Add 'ddgs' to requirements.txt and redeploy.") from exc
+
     _patch_ddgs_google()
-    try:  # an unknown backend makes ddgs silently fall back to 'auto' (Wikipedia first) - refuse that
-        from ddgs.engines import ENGINES
-        valid = set(ENGINES["text"])
-        if backend not in valid:
-            raise RuntimeError(f"backend '{backend}' not available in this ddgs version (valid: {', '.join(sorted(valid))})")
-    except ImportError:
-        pass
+    valid = available_text_backends()
+    if valid and backend not in valid:
+        raise RuntimeError(f"Backend '{backend}' is not supported by this ddgs version. Available: {', '.join(sorted(valid))}")
+
     region = "wt-wt" if backend == "duckduckgo" else "us-en"
     with DDGS() as d:
-        res = d.text(q, region=region, max_results=n, backend=backend)
+        results = d.text(q, region=region, max_results=n, backend=backend)
+
     out = []
-    for r in (res or []):
-        u = r.get("href") or r.get("url")
-        if not u or re.search(r"//[a-z.]*(wikipedia|grokipedia)\.", u):
+    for result in results or []:
+        url = result.get("href") or result.get("url")
+        if not url or not url.startswith(("http://", "https://")):
             continue
-        out.append({"url": u, "title": r.get("title", ""), "snippet": r.get("body", ""), "engine": backend})
+        if re.search(r"//[^/]*(wikipedia|grokipedia)\.", url, re.I):
+            continue
+        out.append({
+            "url": url,
+            "title": result.get("title", ""),
+            "snippet": result.get("body", "") or result.get("snippet", ""),
+            "engine": backend,
+        })
     return out
 
 
-SEARCH_CHAINS = {"google": ["google", "duckduckgo", "brave"], "duckduckgo": ["duckduckgo", "brave", "startpage"]}
+# Try multiple explicit providers. The installed ddgs package may not support every backend;
+# unsupported backends are recorded in diagnostics and skipped without disabling other engines.
+SEARCH_CHAINS = {
+    "google": ["google", "duckduckgo", "brave", "bing", "mojeek"],
+    "duckduckgo": ["duckduckgo", "brave", "google", "bing", "mojeek"],
+}
 
 
-def search_chain(q, n, first, dead=None):
-    """Try engines in order until one returns results. `dead` = engines that already errored this run
-    (blocked/CAPTCHA) and are skipped. -> (results, notes[(engine, count, note)])"""
+def search_chain(q, n, first, dead=None, siteq=""):
+    """Collect and deduplicate results across providers until enough eligible hits are found."""
     notes = []
-    for b in SEARCH_CHAINS.get(first, [first]):
-        if dead is not None and b in dead:
-            continue
+    collected = {}
+    candidates = SEARCH_CHAINS.get(first, [first])
+    valid = available_text_backends()
+    if valid:
+        candidates = [backend for backend in candidates if backend in valid]
+    if not candidates:
+        return [], [("ddgs", 0, "ERROR: no compatible text backend; upgrade ddgs in requirements.txt")]
+
+    for backend in candidates:
         try:
-            res = search_engine(q, n, b)
-            notes.append((b, len(res), ""))
-            if res:
-                return res, notes
-        except Exception as e:
-            msg = str(e)
-            notes.append((b, 0, "no results" if "No results" in msg else "ERROR: " + msg[:130]))
-            if dead is not None and "No results" not in msg:
-                dead.add(b)
-        time.sleep(1.0)
-    return [], notes
+            results = search_engine(q, n, backend)
+            added = 0
+            for result in results:
+                result_url = result.get("url", "")
+                # When searching a particular website, don't let off-domain results stop the fallback chain.
+                if siteq and not url_matches_site(result_url, siteq):
+                    continue
+                key = canonicalize_url(result_url) or result_url
+                if key and key not in collected:
+                    collected[key] = result
+                    added += 1
+            notes.append((backend, len(results), f"{added} new eligible unique URLs"))
+            if len(collected) >= n:
+                break
+        except Exception as exc:
+            message = str(exc).replace("\n", " ")[:130]
+            notes.append((backend, 0, "ERROR: " + message))
+        # Small pause helps reduce rate-limit/CAPTCHA risk; don't mark an engine permanently dead
+        # because a single request can fail transiently.
+        time.sleep(0.35)
+    return list(collected.values())[:n], notes
 
 
 def url_matches_site(url, siteq):
-    """Some engines ignore site:. Keep only hits on the requested domain."""
-    dom = siteq.split("/")[0].lower().strip()
-    host = (urlparse(url).hostname or "").lower()
-    return bool(dom) and (host == dom or host.endswith("." + dom))
+    """Locally enforce the requested domain when a site-specific search is selected."""
+    host_query = (siteq or "").split("/")[0].lower().strip().removeprefix("www.")
+    host = (urlparse(url).hostname or "").lower().removeprefix("www.")
+    return bool(host_query) and (host == host_query or host.endswith("." + host_query))
 
 
 def query_variants(site, kws, mode, add_phd):
-    """Strict query first; looser ones are only used if the strict one returns nothing."""
-    out = [build_query(site, kws, mode, add_phd)]
-    base = f"site:{site.query} " if site.query else ""
-    k1 = kws[0]
-    out.append(f'{base}PhD "{k1}"')
-    host_only = f"site:{site.query.split('/')[0]} " if site.query else ""
-    out.append(f"{host_only}PhD {k1}")
-    seen, uniq = set(), []
-    for q in out:
-        if q not in seen:
-            seen.add(q)
-            uniq.append(q)
-    return uniq
+    """Progressively broaden a query: host + terms, host + first term, then general terms."""
+    clean_kws = [str(k).strip() for k in kws if str(k).strip()]
+    if not clean_kws:
+        return []
+
+    host = site.query.split("/")[0].strip() if site.query else ""
+    variants = [build_query(site, clean_kws, mode, add_phd)]
+    first_kw = f'"{clean_kws[0]}"'
+    phd = PHD_TERMS if add_phd else ""
+    if host:
+        variants.append(" ".join(p for p in [f"site:{host}", phd, first_kw] if p))
+        # Third attempt searches the host without requiring PhD wording, useful when the listing title
+        # uses a local-language or alternative doctoral title.
+        variants.append(" ".join(p for p in [f"site:{host}", first_kw] if p))
+    else:
+        variants.append(" ".join(p for p in [phd, first_kw] if p))
+        variants.append(" ".join(clean_kws))
+
+    seen, unique = set(), []
+    for query in variants:
+        query = query.strip()
+        if query and query not in seen:
+            seen.add(query)
+            unique.append(query)
+    return unique
 
 
 def search_google(q, n, key, cx):
@@ -1055,8 +1114,7 @@ with st.sidebar:
     use_api = engine.startswith("Google Programmable")
     g_key = g_cx = ""
     if engine.startswith("Google direct"):
-        st.caption("Scrapes Google results through the ddgs library. If Google blocks a query, the app "
-                   "automatically retries that query on DuckDuckGo. Keep result counts low and the pause at 3 s or more.")
+        st.caption("Uses ddgs search providers with automatic fallback across supported engines. Search engines may still rate-limit automated requests.")
     if use_api:
         g_key = st.text_input("API key", type="password", value=secret("GOOGLE_CSE_API_KEY"))
         g_cx = st.text_input("Search engine ID (cx)", value=secret("GOOGLE_CSE_ID"))
@@ -1066,17 +1124,23 @@ with st.sidebar:
     max_pages = st.slider("Max pages to download per search", 20, 400, 150, 10)
     pause = st.slider("Pause between queries (s)", 0.5, 10.0, 3.0, 0.5)
     if st.button("🧪 Test search engines & downloads"):
-        for b in ["google", "duckduckgo", "brave", "startpage"]:
+        test_backends = ["google", "duckduckgo", "brave", "bing", "mojeek"]
+        supported = available_text_backends()
+        if supported:
+            test_backends = [b for b in test_backends if b in supported]
+        if not test_backends:
+            st.error("The installed ddgs package exposes no compatible text backends. Upgrade ddgs and redeploy.")
+        for backend in test_backends:
             try:
-                n_ = len(search_engine("site:jobbnorge.no PhD", 5, b))
-                st.write(f"{'✅' if n_ else '⚠️'} {b}: {n_} results")
-            except Exception as e:
-                st.write(f"❌ {b}: {str(e)[:140]}")
+                results = search_engine("site:jobbnorge.no PhD", 5, backend)
+                st.write(f"{'✅' if results else '⚠️'} {backend}: {len(results)} results")
+            except Exception as exc:
+                st.write(f"❌ {backend}: {type(exc).__name__}: {str(exc)[:140]}")
         try:
-            safe_get("https://www.jobbnorge.no/en/available-jobs")
-            st.write("✅ page download works")
-        except Exception as e:
-            st.write(f"❌ page download: {type(e).__name__}: {str(e)[:140]}")
+            data, final_url, content_type = safe_get("https://www.jobbnorge.no/en/available-jobs")
+            st.write(f"✅ page download works ({len(data):,} bytes; {content_type or 'unknown content type'})")
+        except Exception as exc:
+            st.write(f"❌ page download: {type(exc).__name__}: {str(exc)[:140]}")
 
 # ---------------- keywords
 def _apply_preset():
@@ -1156,7 +1220,7 @@ if do_search:
                 except Exception as e:
                     got, notes = [], [("google-api", 0, "ERROR: " + str(e)[:130])]
             else:
-                got, notes = search_chain(q, per_site, first_engine, dead)
+                got, notes = search_chain(q, per_site, first_engine, dead, siteq=siteq)
             raw_n = len(got)
             if siteq:
                 got = [h for h in got if url_matches_site(h["url"], siteq)]
@@ -1197,7 +1261,8 @@ if do_search:
     st.session_state["notice"] = (
         f"Search engines returned {len(hits)} URLs; {ok_n} pages read, {len(bad)} unreadable"
         + (f" (e.g. {bad[0]})" if bad else "") + f"; {saved} saved to the local database."
-        + (" Open 'Search diagnostics' below to see why nothing came back." if not hits else ""))
+        + (" Open 'Search diagnostics' below to see why nothing came back." if not hits else "")
+        + (" Search providers returned no URLs; this is different from finding URLs that could not be downloaded." if not hits else ""))
     st.session_state.pop("outputs", None)
 
 for e in st.session_state.get("errors", []):
@@ -1418,7 +1483,7 @@ with tab_notes:
 - Skills analysis counts keyword mentions; "Required cue / Preferred cue" is a context heuristic, not understanding.
   Always check the evidence snippets. Counts are for your sample, not for Europe as a whole.
 - `All ... universities` entries (`edu.au`, `ac.nz`, `ac.uk`, `.edu`) cover whole countries at once but return noisier hits.
-- Google direct scrapes Google through `ddgs`; when Google blocks a query the app falls back to DuckDuckGo for it (see the warnings). If blocks persist, wait a few minutes, tick fewer sites and increase the pause.
+- Search uses multiple supported `ddgs` providers and merges unique URLs until enough results are found. Search engines may still rate-limit automated requests; use Search diagnostics to see which provider failed.
 - Pages that could not be read (login walls, bot protection) show *snippet only* and are not saved to the database.
 - Downloads block private/local addresses and cap file size, but this is a personal tool, not a hardened public service.
 - Cookie banners may appear on rendered pages; the position text is still included.
