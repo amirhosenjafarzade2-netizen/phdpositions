@@ -325,6 +325,142 @@ def safe_text(v) -> str:
     return re.sub(r"\s+", " ", str(v)).strip()
 
 
+
+def search_site_native(site: Site, keywords, n=20):
+    """
+    Best-effort site-native search. Opens the site's own homepage/search page,
+    finds a search input/form, submits the user's terms, and collects same-domain
+    links from the results. Many sites render results in JavaScript or block bots;
+    those sites fall back to external search engines.
+    """
+    if not site.query or not keywords:
+        return [], "No domain or keywords"
+    host = site.query.split("/")[0].strip().lower()
+    base = "https://" + host
+    query = " ".join(str(k).strip() for k in keywords if str(k).strip())
+    if not query:
+        return [], "No search terms"
+
+    # First try a real browser: handles many JavaScript-powered search forms.
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            page = browser.new_page(user_agent=UA)
+            try:
+                page.goto(base, wait_until="domcontentloaded", timeout=18000)
+                page.wait_for_timeout(800)
+                selectors = [
+                    'input[type="search"]', 'input[name*="search" i]',
+                    'input[id*="search" i]', 'input[placeholder*="search" i]',
+                    'input[name*="query" i]', 'input[name="q"]',
+                    'input[type="text"]'
+                ]
+                submitted = False
+                for selector in selectors:
+                    try:
+                        loc = page.locator(selector).filter(visible=True).first
+                        if loc.count() == 0:
+                            continue
+                        loc.fill(query, timeout=1800)
+                        # Prefer a form submit, then Enter.
+                        try:
+                            loc.press("Enter", timeout=1800)
+                        except Exception:
+                            try:
+                                loc.locator("xpath=ancestor::form").evaluate("(f) => f.submit()")
+                            except Exception:
+                                continue
+                        page.wait_for_timeout(1400)
+                        submitted = True
+                        break
+                    except Exception:
+                        continue
+                if submitted:
+                    anchors = page.locator("a[href]").evaluate_all(
+                        "(els) => els.map(a => ({url:a.href,title:(a.innerText||a.textContent||'').trim()}))"
+                    )
+                    found, seen = [], set()
+                    for a in anchors:
+                        u = a.get("url", "")
+                        title = re.sub(r"\s+", " ", a.get("title", "")).strip()
+                        if not title or not u.startswith(("http://", "https://")):
+                            continue
+                        if not url_matches_site(u, host):
+                            continue
+                        if any(x in urlparse(u).path.lower() for x in
+                               ("/search", "/login", "/signin", "/cookie", "/privacy")):
+                            continue
+                        cu = canonicalize_url(u)
+                        if cu and cu not in seen and cu != canonicalize_url(base):
+                            seen.add(cu)
+                            found.append({"url": u, "title": title[:200],
+                                          "snippet": f"Found through {site.name}'s native search",
+                                          "engine": "site-native"})
+                    if found:
+                        browser.close()
+                        return found[:n], "Playwright native search"
+            finally:
+                browser.close()
+    except Exception:
+        pass
+
+    # Lightweight fallback: inspect HTML forms and submit search-like forms.
+    try:
+        data, final_url, _ = safe_get(base, timeout=12)
+        soup = BeautifulSoup(data, "html.parser")
+        forms = soup.find_all("form")
+        for form in forms:
+            inputs = form.find_all(["input", "textarea"])
+            search_input = None
+            for inp in inputs:
+                name = (inp.get("name") or "").lower()
+                typ = (inp.get("type") or "text").lower()
+                placeholder = (inp.get("placeholder") or "").lower()
+                if typ in ("search", "text") and (
+                    "search" in name or "query" in name or name in ("q", "s", "keyword", "keywords")
+                    or "search" in placeholder
+                ):
+                    search_input = inp
+                    break
+            if not search_input or not search_input.get("name"):
+                continue
+            action = urljoin(final_url, form.get("action") or final_url)
+            if not is_safe_url(action):
+                continue
+            params = {}
+            for inp in inputs:
+                nm = inp.get("name")
+                if nm:
+                    params[nm] = inp.get("value", "")
+            params[search_input["name"]] = query
+            method = (form.get("method") or "get").lower()
+            if method == "get":
+                rr = requests.get(action, params=params, headers=HEADERS, timeout=12)
+            else:
+                rr = requests.post(action, data=params, headers=HEADERS, timeout=12)
+            rr.raise_for_status()
+            result_soup = BeautifulSoup(rr.text, "html.parser")
+            found, seen = [], set()
+            for a in result_soup.find_all("a", href=True):
+                u = urljoin(rr.url, a["href"])
+                title = re.sub(r"\s+", " ", a.get_text(" ", strip=True))
+                if not title or not url_matches_site(u, host):
+                    continue
+                cu = canonicalize_url(u)
+                if cu and cu not in seen and cu != canonicalize_url(base):
+                    seen.add(cu)
+                    found.append({"url": u, "title": title[:200],
+                                  "snippet": f"Found through {site.name}'s native search",
+                                  "engine": "site-native-form"})
+            if found:
+                return found[:n], "HTML form native search"
+    except Exception as exc:
+        return [], f"Native search unavailable: {type(exc).__name__}: {str(exc)[:100]}"
+    return [], "No usable native search form/results detected"
+
+
+
 # ======================================================================================
 # 4. SEARCH
 # ======================================================================================
@@ -901,8 +1037,10 @@ def fallback_pdf(rec):
     ss = getSampleStyleSheet()
     flow = [Paragraph(escape(clean(rec["title"] or rec["url"])), ss["Title"]),
             Paragraph(f'<font color="blue">{escape(clean(rec["url"]))}</font>', ss["BodyText"]), Spacer(1, 12)]
-    for line in [ln for ln in rec["text"].split("\n") if ln.strip()][:600]:
-        flow.append(Paragraph(escape(clean(line[:1500])), ss["BodyText"]))
+    flow.append(Paragraph("Readable text copy generated because a faithful browser/PDF rendering was unavailable.",
+                          ss["Italic"]))
+    for line in [ln for ln in rec["text"].split("\n") if ln.strip()][:1200]:
+        flow.append(Paragraph(escape(clean(line[:3000])), ss["BodyText"]))
     doc.build(flow)
     return buf.getvalue()
 
@@ -1083,6 +1221,8 @@ def run_analysis(hits, bar=None, workers=8):
 
 init_db()
 st.title("🎓 PhD Position Finder, Skills Analyzer & PDF Merger")
+st.caption("Search strategy: try each selected site's own search form first, then fall back to external search providers. "
+           "Native search is best-effort because some sites require JavaScript, cookies, or block automated access.")
 
 try:
     import playwright  # noqa: F401
@@ -1214,7 +1354,18 @@ if do_search:
     for i, (name, variants, country, siteq) in enumerate(jobs):
         bar.progress(i / len(jobs), f"Searching {name}")
         got = []
+        # First search inside the site's own search form when a domain was selected.
+        # If the site has no usable form, or blocks automated browsing, keep the original
+        # multi-engine/API fallback instead of dropping the site from the search.
+        if siteq and KWS:
+            native_site = Site(name, siteq, "Custom")
+            native_hits, native_note = search_site_native(native_site, KWS, per_site)
+            slog.append({"Site": name, "Try": 0, "Query": " ".join(KWS),
+                         "Engine": "site-native", "Results": len(native_hits), "Note": native_note})
+            got = native_hits
         for vi, q in enumerate(variants, 1):
+            if got:
+                break
             if use_api:
                 try:
                     got, notes = search_google(q, per_site, g_key, g_cx), []
