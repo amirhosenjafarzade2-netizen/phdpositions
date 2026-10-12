@@ -1,32 +1,47 @@
 """
-PhD Position Finder & PDF Merger  (Streamlit)
+PhD Position Finder, Skills Analyzer & PDF Merger  (Streamlit)
 
 Run:
     pip install -r requirements.txt
-    playwright install chromium        # optional, but gives much better page->PDF output
+    playwright install chromium        # optional: better page->PDF rendering
     streamlit run app.py
 
-How it works
- 1. For every ticked site, the app builds a search-engine query such as
+Workflow
+ 1. Tick sites (or add your own domains), type keywords, press Search.
+    Each site becomes a query like
         site:jobbnorge.no/en/available-jobs/joblisting ("PhD" OR "doctoral") "reservoir"
-    and runs it through DuckDuckGo (no key needed) or Google Programmable Search (API key).
- 2. Every hit is downloaded and analysed: title, organisation, posted date, deadline,
-    open/closed status, does it really mention PhD / your keywords.
- 3. Filters (open/closed, date interval, PhD-only ...) are applied live on the results.
- 4. You tick the positions you want -> each page is converted to PDF (or downloaded if it
-    already is a PDF) -> everything is merged into ONE PDF with a cover index + bookmarks.
+    run through DuckDuckGo (no key) or Google Programmable Search (API key).
+ 2. Every hit is downloaded and analysed (SSRF-safe, size-limited): title, organisation,
+    posted date, deadline (+ where it came from), open/closed, PhD / keyword match.
+ 3. Filters (open/closed, date interval, PhD-only, keyword-only) are applied live.
+ 4. Results are stored in a local SQLite database (review status, manual deadlines).
+ 5. Skills analysis counts recurring skill areas / tools with auditable evidence snippets.
+ 6. Tick positions -> pages become PDFs (or originals are downloaded) -> ONE merged PDF
+    with a cover index + bookmarks, plus a ZIP with the separate PDFs and CSVs.
+
+Extracted fields are CANDIDATES, not verified facts. Always check the source page.
 """
 
+from __future__ import annotations
+
 import csv
-import datetime as dt
+import hashlib
 import io
+import ipaddress
 import json
+import os
 import re
+import socket
+import sqlite3
 import time
 import zipfile
+import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from functools import lru_cache
+from pathlib import Path
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from xml.sax.saxutils import escape
 
 import pandas as pd
@@ -40,9 +55,19 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-# --------------------------------------------------------------------------------------
-# 1. SITE LIST  (edit freely!)  query = what goes after  site:   ("" = whole web)
-# --------------------------------------------------------------------------------------
+st.set_page_config(page_title="PhD Position Finder", page_icon="🎓", layout="wide")
+
+DB_PATH = Path(os.environ.get("PHD_FINDER_DB", "phd_positions.sqlite3"))
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/124.0 Safari/537.36")
+HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.8",
+           "Accept": "text/html,application/xhtml+xml,application/pdf;q=0.9,*/*;q=0.8"}
+REQUEST_TIMEOUT = 20
+MAX_BYTES = 25 * 1024 * 1024
+
+# ======================================================================================
+# 1. SITE LIST (edit freely!)   query = what goes after  site:   ("" = whole web)
+# ======================================================================================
 
 
 @dataclass(frozen=True)
@@ -66,24 +91,42 @@ SITES = [
     # ---- Norway
     Site("Jobbnorge", "jobbnorge.no/en/available-jobs/joblisting", "Norway", True),
     Site("NTNU", "ntnu.edu", "Norway", True),
+    Site("University of Stavanger", "uis.no", "Norway"),
     Site("University of Oslo", "uio.no", "Norway"),
     Site("University of Bergen", "uib.no", "Norway"),
     Site("UiT", "uit.no", "Norway"),
     # ---- Netherlands
     Site("AcademicTransfer", "academictransfer.com", "Netherlands", True),
+    Site("TU Delft", "tudelft.nl", "Netherlands"),
+    Site("Wageningen (WUR)", "wur.nl", "Netherlands"),
+    # ---- Denmark / Finland
+    Site("DTU", "dtu.dk", "Denmark"),
+    Site("University of Copenhagen", "ku.dk", "Denmark"),
+    Site("Aalto", "aalto.fi", "Finland"),
+    Site("University of Helsinki", "helsinki.fi", "Finland"),
+    Site("University of Oulu", "oulu.fi", "Finland"),
     # ---- UK / Ireland
     Site("jobs.ac.uk", "jobs.ac.uk", "UK"),
+    Site("Heriot-Watt", "hw.ac.uk", "UK"),
+    Site("Imperial College", "imperial.ac.uk", "UK"),
+    Site("University of Manchester", "manchester.ac.uk", "UK"),
     Site("All UK universities (ac.uk)", "ac.uk", "UK"),
     # ---- Germany
     Site("academics.de", "academics.de", "Germany"),
     Site("DAAD", "daad.de", "Germany"),
+    Site("RWTH Aachen", "rwth-aachen.de", "Germany"),
+    Site("TU Munich", "tum.de", "Germany"),
+    Site("University of Stuttgart", "uni-stuttgart.de", "Germany"),
     # ---- Sweden
     Site("Varbi (Swedish universities)", "varbi.com", "Sweden"),
+    Site("Chalmers", "chalmers.se", "Sweden"),
+    Site("KTH", "kth.se", "Sweden"),
+    Site("Lund University", "lu.se", "Sweden"),
+    Site("Uppsala University", "uu.se", "Sweden"),
     # ---- Canada
     Site("University Affairs (CA)", "universityaffairs.ca", "Canada"),
-    # ---- Australia
+    # ---- Australia / NZ
     Site("All Australian universities (edu.au)", "edu.au", "Australia"),
-    # ---- New Zealand
     Site("All NZ universities (ac.nz)", "ac.nz", "New Zealand"),
     # ---- USA
     Site("AcademicJobsOnline", "academicjobsonline.org", "USA"),
@@ -96,41 +139,213 @@ SITES = [
     Site("Open web (no site filter)", "", "Open web"),
 ]
 
-REGION_ORDER = ["Europe", "Global", "Norway", "Netherlands", "UK", "Germany", "Sweden",
-                "Canada", "Australia", "New Zealand", "USA", "Open web"]
+REGION_ORDER = ["Europe", "Global", "Norway", "Netherlands", "Denmark", "Finland", "UK", "Germany",
+                "Sweden", "Canada", "Australia", "New Zealand", "USA", "Open web"]
+COUNTRY_REGIONS = {"Norway": "Norway", "Netherlands": "Netherlands", "Denmark": "Denmark",
+                   "Finland": "Finland", "UK": "United Kingdom", "Germany": "Germany",
+                   "Sweden": "Sweden", "Canada": "Canada", "Australia": "Australia",
+                   "New Zealand": "New Zealand", "USA": "United States"}
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-      "Chrome/124.0 Safari/537.36")
-HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.8"}
+KEYWORD_PRESETS = {
+    "(none)": "",
+    "Reservoir simulation": "reservoir simulation, reservoir modelling",
+    "CCS / CO2 storage": "CO2 storage, carbon capture",
+    "Geothermal": "geothermal",
+    "Drilling & wells": "drilling, wellbore, well",
+    "Porous media / multiphase flow": "porous media, multiphase flow",
+    "Subsurface + machine learning": "machine learning, reservoir, subsurface",
+}
 
-# --------------------------------------------------------------------------------------
-# 2. SEARCH
-# --------------------------------------------------------------------------------------
+# ======================================================================================
+# 2. SKILL TAXONOMY (screening heuristic; evidence snippets are always provided)
+# ======================================================================================
+
+SKILL_TAXONOMY = {
+    "Reservoir simulation": [
+        "reservoir simulation", "reservoir modelling", "reservoir modeling", "flow simulation",
+        "compositional simulation", "black-oil", "history matching", "cmg", "eclipse",
+        "tnavigator", "intersect", "opm flow", "mrst", "imex", "gem", "stars"],
+    "Programming & software development": [
+        "python", "matlab", "c++", "fortran", "julia", "software development", "git",
+        "github", "version control", "jupyter", "linux"],
+    "Machine learning & data science": [
+        "machine learning", "deep learning", "artificial intelligence", "random forest",
+        "neural network", "data science", "data-driven", "surrogate model", "shap",
+        "pytorch", "tensorflow", "scikit-learn", "physics-informed"],
+    "Numerical methods & HPC": [
+        "numerical methods", "numerical modelling", "numerical modeling", "finite element",
+        "finite volume", "computational fluid dynamics", "cfd", "high-performance computing",
+        "hpc", "parallel computing", "inverse problem", "pde", "partial differential"],
+    "Porous media & multiphase flow": [
+        "porous media", "porous medium", "multiphase flow", "relative permeability",
+        "capillary pressure", "darcy", "pore-scale", "pore scale", "reactive transport",
+        "digital rock", "core flooding", "core-flooding"],
+    "History matching, uncertainty & optimization": [
+        "history matching", "uncertainty quantification", "uncertainty analysis",
+        "data assimilation", "ensemble smoother", "ensemble kalman", "parameter estimation",
+        "optimization", "optimisation", "sensitivity analysis", "monte carlo", "bayesian"],
+    "CCS & subsurface storage": [
+        "carbon capture", "ccs", "ccus", "co2 storage", "co2-storage", "geological storage",
+        "carbon sequestration", "hydrogen storage", "underground hydrogen", "subsurface storage",
+        "co₂"],
+    "Geothermal energy": [
+        "geothermal", "enhanced geothermal", "heat storage", "thermal energy storage"],
+    "Drilling & well engineering": [
+        "drilling", "well control", "well integrity", "drilling fluids", "cementing",
+        "managed pressure drilling", "wellbore", "borehole", "directional drilling"],
+    "Production, EOR & flow assurance": [
+        "production engineering", "enhanced oil recovery", "eor", "flow assurance",
+        "artificial lift", "well test", "production optimization", "chemical flooding",
+        "polymer flooding", "gas injection", "low salinity"],
+    "Geomechanics & rock physics": [
+        "geomechanics", "rock mechanics", "rock physics", "fracture", "hydraulic fracturing",
+        "stress field", "poroelasticity", "geomechanical"],
+    "Geochemistry & reactive transport": [
+        "geochemistry", "geochemical", "mineralization", "mineral trapping", "phreeqc"],
+    "Scientific writing & collaboration": [
+        "scientific writing", "peer-reviewed", "publications", "interdisciplinary",
+        "collaboration", "communication skills", "teamwork", "english"],
+}
+SKILL_PATTERNS = {
+    cat: [(t, re.compile(r"(?<!\w)" + re.escape(t) + r"(?!\w)", re.I)) for t in terms]
+    for cat, terms in SKILL_TAXONOMY.items()}
+
+NEG_CUES = ["not required", "not essential", "no experience required", "no prior experience",
+            "not necessary", "not a requirement"]
+REQ_CUES = ["required", "must have", "must possess", "must hold", "essential", "minimum requirement",
+            "we require", "mandatory", "prerequisite", "you have", "you hold", "you will have",
+            "candidate must", "applicant must", "solid knowledge", "strong background", "proven"]
+PREF_CUES = ["preferred", "desirable", "advantage", "ideally", "beneficial", "is a plus",
+             "nice to have", "we welcome", "an asset", "meritorious", "considered a plus"]
+REQ_HEADERS = ["requirements", "qualifications", "your profile", "we expect", "what you bring",
+               "who you are", "what we are looking for", "you have"]
+PREF_HEADERS = ["desirable", "preferred", "advantageous", "nice to have", "would be a plus",
+                "additional qualifications", "meritorious"]
+RANK = {"Required cue": 4, "Preferred cue": 3, "Mentioned only": 2, "Negated": 1}
+
+# ======================================================================================
+# 3. URL SAFETY + HTTP
+# ======================================================================================
+
+
+@lru_cache(maxsize=1024)
+def is_public_host(host: str) -> bool:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return False
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        except ValueError:
+            return False
+        if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+                or ip.is_multicast or ip.is_unspecified):
+            return False
+    return True
+
+
+def is_safe_url(url: str) -> bool:
+    """HTTP(S) only, no credentials, no local/private targets (basic SSRF guard)."""
+    try:
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname or p.username or p.password:
+            return False
+        host = p.hostname.lower().rstrip(".")
+        if host == "localhost" or "." not in host or host.endswith((".local", ".internal", ".localhost")):
+            return False
+        return is_public_host(host)
+    except Exception:
+        return False
+
+
+def safe_get(url: str, max_bytes: int = MAX_BYTES, timeout: int = REQUEST_TIMEOUT):
+    """GET with manual redirect validation and a hard size cap. -> (bytes, final_url, content_type)"""
+    cur = url
+    with requests.Session() as s:
+        s.headers.update(HEADERS)
+        for _ in range(6):
+            if not is_safe_url(cur):
+                raise ValueError("URL blocked by safety checks")
+            r = s.get(cur, timeout=timeout, stream=True, allow_redirects=False)
+            try:
+                if r.status_code in (301, 302, 303, 307, 308):
+                    loc = r.headers.get("Location")
+                    if not loc:
+                        raise ValueError("redirect without Location")
+                    cur = urljoin(cur, loc)
+                    continue
+                r.raise_for_status()
+                try:
+                    if int(r.headers.get("Content-Length") or 0) > max_bytes:
+                        raise ValueError("file too large")
+                except ValueError as e:
+                    if "too large" in str(e):
+                        raise
+                buf = bytearray()
+                for chunk in r.iter_content(65536):
+                    buf += chunk
+                    if len(buf) > max_bytes:
+                        raise ValueError("file too large")
+                return bytes(buf), cur, r.headers.get("content-type", "").lower()
+            finally:
+                r.close()
+    raise ValueError("too many redirects")
+
+
+def canonicalize_url(url: str) -> str:
+    try:
+        p = urlparse(url.strip())
+        if p.scheme not in ("http", "https") or not p.netloc:
+            return ""
+        host = p.netloc.lower().removeprefix("www.")
+        path = re.sub(r"/{2,}", "/", p.path or "/")
+        if path != "/":
+            path = path.rstrip("/")
+        drop = {"fbclid", "gclid", "ref", "mc_cid", "mc_eid"}
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+             if not k.lower().startswith("utm_") and k.lower() not in drop]
+        return urlunparse((p.scheme.lower(), host, path, "", urlencode(sorted(q)), ""))
+    except Exception:
+        return ""
+
+
+def safe_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (list, tuple)):
+        return "; ".join(safe_text(x) for x in v if x is not None)
+    if isinstance(v, dict):
+        return safe_text(v.get("name") or v.get("value") or "")
+    return re.sub(r"\s+", " ", str(v)).strip()
+
+
+# ======================================================================================
+# 4. SEARCH
+# ======================================================================================
 
 PHD_TERMS = '("PhD" OR "doctoral" OR "doctorate" OR "PhD position")'
 PHD_RE = re.compile(r"\bph\.?\s?d\b|doctoral|doctorate|promovend|doktorand|doktorgrad|stipendiat|"
                     r"\bdphil\b|research fellow.{0,20}(?:phd|doctoral)", re.I)
+POSTDOC_RE = re.compile(r"post[\s-]?doc|postdoctoral|professor|lecturer|assistant professor", re.I)
 
 
 def build_query(site: Site, kws, mode, add_phd):
     quoted = [f'"{k}"' for k in kws]
-    if len(quoted) > 1 and mode == "any":
-        kw_part = "(" + " OR ".join(quoted) + ")"
-    else:
-        kw_part = " ".join(quoted)
+    kw_part = ("(" + " OR ".join(quoted) + ")") if (len(quoted) > 1 and mode == "any") else " ".join(quoted)
     parts = []
     if site.query:
         parts.append(f"site:{site.query}")
     if add_phd or not site.query:
         parts.append(PHD_TERMS)
     parts.append(kw_part)
-    return " ".join(parts)
+    return " ".join(p for p in parts if p)
 
 
 def search_ddg(q, n):
     try:
         from ddgs import DDGS
-    except ImportError:  # old package name
+    except ImportError:
         from duckduckgo_search import DDGS
     last = None
     for attempt in range(3):
@@ -139,7 +354,7 @@ def search_ddg(q, n):
                 res = d.text(q, max_results=n)
             return [{"url": r.get("href") or r.get("url"), "title": r.get("title", ""),
                      "snippet": r.get("body", "")} for r in res]
-        except Exception as e:  # rate limit etc.
+        except Exception as e:
             last = e
             time.sleep(3 * (attempt + 1))
     raise RuntimeError(f"DuckDuckGo failed: {last}")
@@ -161,16 +376,9 @@ def search_google(q, n, key, cx):
     return out[:n]
 
 
-def norm_url(u):
-    p = urlparse(u)
-    q = [(k, v) for k, v in parse_qsl(p.query)
-         if not k.lower().startswith("utm_") and k.lower() not in {"fbclid", "gclid"}]
-    return urlunparse((p.scheme, p.netloc.lower(), p.path.rstrip("/") or "/", "", urlencode(q), ""))
-
-
-# --------------------------------------------------------------------------------------
-# 3. PAGE ANALYSIS  (title, org, dates, open/closed)
-# --------------------------------------------------------------------------------------
+# ======================================================================================
+# 5. PAGE ANALYSIS
+# ======================================================================================
 
 DATE_RE = (r"(?P<d>\d{4}-\d{2}-\d{2}"
            r"|\d{1,2}[./-]\d{1,2}[./-]\d{2,4}"
@@ -188,7 +396,7 @@ CLOSED_RE = re.compile(r"no longer (?:available|accepting)|position (?:has been 
 
 def parse_date(s):
     try:
-        d = dtparser.parse(s, dayfirst=not re.match(r"\d{4}-", s), fuzzy=True)
+        d = dtparser.parse(s, dayfirst=not re.match(r"\s*\d{4}-", s), fuzzy=True)
         if 2000 <= d.year <= 2100:
             return d.date()
     except Exception:
@@ -219,78 +427,126 @@ def find_jobposting(obj):
 
 
 def keyword_hit(text_l, kws, mode):
+    if not kws:
+        return True
     hits = [k.lower() in text_l for k in kws]
     return any(hits) if mode == "any" else all(hits)
 
 
-def analyze(hit, kws, mode):
-    url = hit["url"]
-    rec = dict(url=url, title=hit.get("title", ""), site=hit.get("site", ""), org="",
-               posted=None, deadline=None, status="unknown", is_pdf=False, content=None,
-               text="", has_phd=False, has_kw=False)
-    today = dt.date.today()
+def phd_flag(title, text):
+    if PHD_RE.search(title):
+        return True
+    if POSTDOC_RE.search(title):
+        return False
+    return bool(PHD_RE.search(text[:25000]))
+
+
+def compute_status(deadline, page_closed=False, fallback="unknown"):
+    if deadline:
+        return "open" if deadline >= dt.date.today() else "closed"
+    return "closed" if page_closed else fallback
+
+
+def new_rec(url, hit=None):
+    hit = hit or {}
+    return dict(url=url, canonical_url=canonicalize_url(url) or url, title=hit.get("title", ""),
+                site=hit.get("site", ""), org="", location="", country=hit.get("country", ""),
+                posted=None, deadline=None, deadline_source="", status="unknown", is_pdf=False,
+                content=None, text="", has_phd=False, has_kw=False,
+                search_query=hit.get("query", ""), review_status="Needs review", error="",
+                upload=False)
+
+
+def analyze(hit):
+    """Download one hit and extract fields. Never raises."""
+    rec = new_rec(hit["url"], hit)
+    page_closed = False
     try:
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-        ctype = r.headers.get("content-type", "").lower()
-        if "pdf" in ctype or url.lower().split("?")[0].endswith(".pdf"):
+        data, final_url, ctype = safe_get(hit["url"])
+        rec["url"] = final_url
+        rec["canonical_url"] = canonicalize_url(final_url) or rec["canonical_url"]
+        if "pdf" in ctype or data[:5] == b"%PDF-":
             rec["is_pdf"] = True
-            if len(r.content) < 30_000_000:
-                rec["content"] = r.content
-            reader = PdfReader(io.BytesIO(r.content))
-            rec["text"] = "\n".join((p.extract_text() or "") for p in reader.pages[:4])
+            rec["content"] = data
+            try:
+                reader = PdfReader(io.BytesIO(data), strict=False)
+                rec["text"] = "\n".join((p.extract_text() or "") for p in reader.pages[:6])
+            except Exception:
+                pass
             if not rec["title"]:
-                rec["title"] = url.rsplit("/", 1)[-1]
+                rec["title"] = Path(urlparse(final_url).path).name or final_url
         else:
-            soup = BeautifulSoup(r.text, "html.parser")
+            soup = BeautifulSoup(data, "html.parser")
             jp = None
             for tag in soup.find_all("script", type="application/ld+json"):
                 try:
-                    jp = find_jobposting(json.loads(tag.string or ""))
+                    jp = find_jobposting(json.loads(tag.string or tag.get_text() or ""))
                 except Exception:
                     jp = None
                 if jp:
                     break
-            title = None
-            if jp and jp.get("title"):
-                title = str(jp["title"])
-                org = jp.get("hiringOrganization")
-                rec["org"] = org.get("name", "") if isinstance(org, dict) else str(org or "")
+            title = ""
+            if jp:
+                title = safe_text(jp.get("title"))
+                rec["org"] = safe_text(jp.get("hiringOrganization"))
+                loc = jp.get("jobLocation", "")
+                if isinstance(loc, list):
+                    loc = loc[0] if loc else ""
+                if isinstance(loc, dict):
+                    addr = loc.get("address", {})
+                    if isinstance(addr, dict):
+                        rec["location"] = ", ".join(filter(None, [safe_text(addr.get("addressLocality")),
+                                                                  safe_text(addr.get("addressRegion"))]))
+                        rec["country"] = safe_text(addr.get("addressCountry")) or rec["country"]
                 if jp.get("datePosted"):
                     rec["posted"] = parse_date(str(jp["datePosted"]))
                 if jp.get("validThrough"):
                     rec["deadline"] = parse_date(str(jp["validThrough"]))
+                    if rec["deadline"]:
+                        rec["deadline_source"] = "JSON-LD validThrough (verify)"
             if not title:
                 og = soup.find("meta", property="og:title")
                 h1 = soup.find("h1")
                 title = (og.get("content") if og and og.get("content")
                          else h1.get_text(" ", strip=True) if h1
                          else soup.title.get_text(strip=True) if soup.title else rec["title"])
-            rec["title"] = re.sub(r"\s+", " ", title).strip()[:200]
+            if not rec["org"]:
+                og = soup.find("meta", property="og:site_name")
+                rec["org"] = safe_text(og.get("content")) if og and og.get("content") else ""
+            rec["title"] = re.sub(r"\s+", " ", title or "").strip()[:200] or rec["title"]
             for t in soup(["script", "style", "noscript", "svg"]):
                 t.decompose()
             rec["text"] = soup.get_text("\n", strip=True)[:40000]
-    except Exception:
+    except Exception as e:
+        rec["error"] = f"{type(e).__name__}: {str(e)[:150]}"
         rec["text"] = hit.get("snippet", "")
 
     blob = rec["title"] + "\n" + rec["text"]
     flat = re.sub(r"\s+", " ", blob[:60000])
-    rec["has_phd"] = bool(PHD_RE.search(blob))
-    rec["has_kw"] = keyword_hit(blob.lower(), kws, mode)
+    rec["has_phd"] = phd_flag(rec["title"], rec["text"] or hit.get("snippet", ""))
     if not rec["deadline"]:
         rec["deadline"] = labeled_date(flat, DEADLINE_LABEL)
+        if rec["deadline"]:
+            rec["deadline_source"] = "Text near deadline label (verify)"
     if not rec["posted"]:
         rec["posted"] = labeled_date(flat, POSTED_LABEL)
-    if rec["deadline"]:
-        rec["status"] = "open" if rec["deadline"] >= today else "closed"
-    elif CLOSED_RE.search(flat[:5000]):
-        rec["status"] = "closed"
+    page_closed = bool(CLOSED_RE.search(flat[:5000]))
+    rec["status"] = compute_status(rec["deadline"], page_closed)
     return rec
 
 
-# --------------------------------------------------------------------------------------
-# 4. FILTERING
-# --------------------------------------------------------------------------------------
+def refresh_flags(recs, kws, mode):
+    """Keyword match is recomputed live, so changing keywords re-filters instantly."""
+    for r in recs:
+        blob = (r["title"] + "\n" + r["text"]).lower()
+        r["has_kw"] = keyword_hit(blob, kws, mode)
+        if r["deadline"]:
+            r["status"] = compute_status(r["deadline"])
+
+
+# ======================================================================================
+# 6. FILTERING
+# ======================================================================================
 
 
 def passes(r, f):
@@ -312,9 +568,185 @@ def passes(r, f):
     return True
 
 
-# --------------------------------------------------------------------------------------
-# 5. PDF CREATION + MERGING
-# --------------------------------------------------------------------------------------
+# ======================================================================================
+# 7. SQLITE STORAGE
+# ======================================================================================
+
+
+@contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+
+def init_db():
+    with db() as con:
+        con.execute("""CREATE TABLE IF NOT EXISTS positions (
+            canonical_url TEXT PRIMARY KEY, url TEXT NOT NULL, title TEXT, org TEXT, location TEXT,
+            country TEXT, site TEXT, posted TEXT, deadline TEXT, deadline_source TEXT, status TEXT,
+            is_pdf INTEGER, has_phd INTEGER, text TEXT, search_query TEXT,
+            review_status TEXT DEFAULT 'Needs review', first_seen TEXT, last_seen TEXT)""")
+
+
+def d2s(d):
+    return d.isoformat() if d else ""
+
+
+def s2d(s):
+    try:
+        return dt.date.fromisoformat(s) if s else None
+    except ValueError:
+        return None
+
+
+UPSERT = """
+INSERT INTO positions (canonical_url,url,title,org,location,country,site,posted,deadline,deadline_source,
+    status,is_pdf,has_phd,text,search_query,first_seen,last_seen)
+VALUES (:canonical_url,:url,:title,:org,:location,:country,:site,:posted,:deadline,:deadline_source,
+    :status,:is_pdf,:has_phd,:text,:search_query,:now,:now)
+ON CONFLICT(canonical_url) DO UPDATE SET
+    url=excluded.url, title=excluded.title, org=excluded.org, location=excluded.location,
+    country=excluded.country, site=excluded.site, posted=excluded.posted, is_pdf=excluded.is_pdf,
+    has_phd=excluded.has_phd, text=excluded.text, search_query=excluded.search_query,
+    last_seen=excluded.last_seen,
+    deadline=CASE WHEN positions.deadline_source='Manual' THEN positions.deadline ELSE excluded.deadline END,
+    status=CASE WHEN positions.deadline_source='Manual' THEN positions.status ELSE excluded.status END,
+    deadline_source=CASE WHEN positions.deadline_source='Manual' THEN 'Manual' ELSE excluded.deadline_source END
+"""
+
+
+def save_records(recs):
+    now = dt.datetime.now().replace(microsecond=0).isoformat()
+    n = 0
+    with db() as con:
+        for r in recs:
+            if r.get("upload") or r.get("error"):
+                continue  # unreadable pages / uploads are not persisted
+            con.execute(UPSERT, dict(
+                canonical_url=r["canonical_url"], url=r["url"], title=r["title"], org=r["org"],
+                location=r["location"], country=r["country"], site=r["site"], posted=d2s(r["posted"]),
+                deadline=d2s(r["deadline"]), deadline_source=r["deadline_source"], status=r["status"],
+                is_pdf=int(r["is_pdf"]), has_phd=int(r["has_phd"]), text=r["text"][:40000],
+                search_query=r["search_query"], now=now))
+            n += 1
+    return n
+
+
+def load_db_records():
+    with db() as con:
+        rows = [dict(x) for x in con.execute("SELECT * FROM positions ORDER BY last_seen DESC")]
+    out = []
+    for x in rows:
+        r = new_rec(x["url"])
+        r.update(canonical_url=x["canonical_url"], title=x["title"] or "", org=x["org"] or "",
+                 location=x["location"] or "", country=x["country"] or "", site=x["site"] or "",
+                 posted=s2d(x["posted"]), deadline=s2d(x["deadline"]),
+                 deadline_source=x["deadline_source"] or "", is_pdf=bool(x["is_pdf"]),
+                 has_phd=bool(x["has_phd"]), text=x["text"] or "", search_query=x["search_query"] or "",
+                 review_status=x["review_status"] or "Needs review")
+        r["status"] = compute_status(r["deadline"], fallback=x["status"] or "unknown")
+        out.append(r)
+    return out
+
+
+def db_update_review(canon, status):
+    with db() as con:
+        con.execute("UPDATE positions SET review_status=? WHERE canonical_url=?", (status, canon))
+
+
+def db_set_deadline(canon, d):
+    with db() as con:
+        con.execute("UPDATE positions SET deadline=?, deadline_source='Manual', status=? WHERE canonical_url=?",
+                    (d.isoformat(), compute_status(d), canon))
+
+
+def db_delete(canons):
+    with db() as con:
+        con.executemany("DELETE FROM positions WHERE canonical_url=?", [(c,) for c in canons])
+
+
+# ======================================================================================
+# 8. SKILLS ANALYSIS
+# ======================================================================================
+
+
+def _context(text, s, e, w=170):
+    left, right = text[max(0, s - w):s], text[e:e + w]
+    lm = list(re.finditer(r"[.!?;•]\s", left))
+    if lm:
+        left = left[lm[-1].end():]
+    rm = re.search(r"[.!?;•](\s|$)", right)
+    if rm:
+        right = right[:rm.end()]
+    return left, right
+
+
+def _classify(text, s, e):
+    left, right = _context(text, s, e)
+    ctx = (left + text[s:e] + right).lower()
+    if any(c in ctx for c in NEG_CUES):
+        return "Negated", left + text[s:e] + right
+    if any(c in ctx for c in REQ_CUES):
+        return "Required cue", left + text[s:e] + right
+    if any(c in ctx for c in PREF_CUES):
+        return "Preferred cue", left + text[s:e] + right
+    back = text[max(0, s - 600):s].lower()
+    req_pos = max((back.rfind(h) for h in REQ_HEADERS), default=-1)
+    pref_pos = max((back.rfind(h) for h in PREF_HEADERS), default=-1)
+    if pref_pos > req_pos:
+        return "Preferred cue", left + text[s:e] + right
+    if req_pos >= 0:
+        return "Required cue", left + text[s:e] + right
+    return "Mentioned only", left + text[s:e] + right
+
+
+def analyze_skills(recs):
+    """-> (area summary, term summary, evidence table). One best snippet per term per vacancy."""
+    ev = []
+    for r in recs:
+        text = re.sub(r"[ \t]+", " ", (r["title"] + ". " + r["text"]))
+        text = re.sub(r"\s*\n\s*", " • ", text)
+        for cat, pats in SKILL_PATTERNS.items():
+            for term, pat in pats:
+                best = None
+                for m in pat.finditer(text):
+                    cls, snip = _classify(text, m.start(), m.end())
+                    if best is None or RANK[cls] > RANK[best[0]]:
+                        best = (cls, snip)
+                if best:
+                    ev.append({"Skill area": cat, "Matched term": term, "Classification (heuristic)": best[0],
+                               "Vacancy": r["title"], "Organisation": r["org"], "URL": r["url"],
+                               "Evidence snippet": best[1].strip()[:420]})
+    if not ev:
+        e = pd.DataFrame()
+        return e, e, e
+    evd = pd.DataFrame(ev)
+    per = (evd.assign(rank=evd["Classification (heuristic)"].map(RANK))
+              .sort_values("rank", ascending=False)
+              .drop_duplicates(["Skill area", "URL"]))
+    n = max(1, len(recs))
+    summ = per.groupby("Skill area").agg(
+        **{"Vacancies mentioning": ("URL", "nunique"),
+           "Required cue": ("Classification (heuristic)", lambda s: int((s == "Required cue").sum())),
+           "Preferred cue": ("Classification (heuristic)", lambda s: int((s == "Preferred cue").sum())),
+           "Mentioned only": ("Classification (heuristic)", lambda s: int((s == "Mentioned only").sum())),
+           "Negated": ("Classification (heuristic)", lambda s: int((s == "Negated").sum()))}
+    ).reset_index()
+    summ["Share of vacancies (%)"] = (summ["Vacancies mentioning"] / n * 100).round(1)
+    summ = summ.sort_values(["Vacancies mentioning", "Required cue"], ascending=False)
+    terms = (evd.groupby(["Skill area", "Matched term"])["URL"].nunique().reset_index()
+                .rename(columns={"URL": "Vacancies"}).sort_values("Vacancies", ascending=False))
+    return summ, terms, evd
+
+
+# ======================================================================================
+# 9. PDF CREATION + MERGING
+# ======================================================================================
 
 
 def clean(s):
@@ -322,15 +754,13 @@ def clean(s):
 
 
 def fallback_pdf(rec):
-    """Pure-python text PDF (used when Playwright is unavailable or fails)."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=50, rightMargin=50, topMargin=50, bottomMargin=50)
-    st_ = getSampleStyleSheet()
-    flow = [Paragraph(escape(clean(rec["title"])), st_["Title"]),
-            Paragraph(f'<font color="blue">{escape(rec["url"])}</font>', st_["BodyText"]), Spacer(1, 12)]
-    for line in rec["text"].split("\n"):
-        if line.strip():
-            flow.append(Paragraph(escape(clean(line[:1500])), st_["BodyText"]))
+    ss = getSampleStyleSheet()
+    flow = [Paragraph(escape(clean(rec["title"] or rec["url"])), ss["Title"]),
+            Paragraph(f'<font color="blue">{escape(clean(rec["url"]))}</font>', ss["BodyText"]), Spacer(1, 12)]
+    for line in [ln for ln in rec["text"].split("\n") if ln.strip()][:600]:
+        flow.append(Paragraph(escape(clean(line[:1500])), ss["BodyText"]))
     doc.build(flow)
     return buf.getvalue()
 
@@ -368,14 +798,14 @@ def make_cover(recs):
     s = getSampleStyleSheet()
     small = ParagraphStyle("small", parent=s["BodyText"], fontSize=7.5, leading=9)
     flow = [Paragraph("PhD positions - compiled " + dt.date.today().isoformat(), s["Title"]),
-            Paragraph(f"{len(recs)} positions", s["BodyText"]), Spacer(1, 10)]
+            Paragraph(f"{len(recs)} positions. Deadlines/status are extracted automatically and may be "
+                      "wrong - verify on the source page.", s["BodyText"]), Spacer(1, 10)]
     data = [["#", "Title", "Site / organisation", "Deadline", "Status", "URL"]]
     for i, r in enumerate(recs, 1):
         data.append([str(i), Paragraph(escape(clean(r["title"])), small),
                      Paragraph(escape(clean(r["site"] + (" / " + r["org"] if r["org"] else ""))), small),
-                     str(r["deadline"] or "?"), r["status"],
-                     Paragraph(escape(r["url"]), small)])
-    t = Table(data, colWidths=[20, 150, 100, 52, 40, 190], repeatRows=1)
+                     str(r["deadline"] or "?"), r["status"], Paragraph(escape(clean(r["url"])), small)])
+    t = Table(data, colWidths=[20, 140, 95, 52, 45, 183], repeatRows=1)
     t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f3a5f")),
                            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
@@ -387,9 +817,20 @@ def make_cover(recs):
     return buf.getvalue()
 
 
+def recs_to_csv(recs):
+    s = io.StringIO()
+    wr = csv.writer(s)
+    wr.writerow(["title", "site", "organisation", "country", "status", "deadline", "deadline_source",
+                 "posted", "review_status", "url"])
+    for r in recs:
+        wr.writerow([r["title"], r["site"], r["org"], r["country"], r["status"], r["deadline"] or "",
+                     r["deadline_source"], r["posted"] or "", r["review_status"], r["url"]])
+    return s.getvalue()
+
+
 def build_outputs(recs, use_pw, progress):
     pdfs, warn = {}, None
-    need = [r["url"] for r in recs if not r["is_pdf"]]
+    need = [r["url"] for r in recs if not r["is_pdf"] and not r["upload"] and is_safe_url(r["url"])]
     if use_pw and need:
         for i in range(0, len(need), 4):
             try:  # separate thread -> no asyncio-loop clash with Streamlit
@@ -399,56 +840,107 @@ def build_outputs(recs, use_pw, progress):
                 warn = f"Playwright unavailable ({str(e)[:120]}). Using plain-text fallback for pages."
                 break
             progress(min(1.0, (i + 4) / len(need)) * 0.7, "Rendering pages with headless Chrome...")
-    final, ok = [], []
+
+    final, report = [], []
     for i, r in enumerate(recs):
-        b = r["content"] if r["is_pdf"] else pdfs.get(r["url"])
+        b, how = None, ""
+        if r["is_pdf"]:
+            b, how = r.get("content"), "original PDF"
+            if b is None and not r["upload"]:
+                try:
+                    b = safe_get(r["url"])[0]
+                except Exception:
+                    b = None
+        else:
+            b, how = pdfs.get(r["url"]), "rendered page (Chrome)"
+        if b:
+            try:
+                rd = PdfReader(io.BytesIO(b), strict=False)
+                if rd.is_encrypted or len(rd.pages) == 0:
+                    b = None
+            except Exception:
+                b = None
         if not b:
-            b = fallback_pdf(r)
-        try:
-            PdfReader(io.BytesIO(b))  # validate
-        except Exception:
-            b = fallback_pdf(r)
+            b, how = fallback_pdf(r), "plain-text fallback"
         final.append(b)
-        ok.append(r)
+        report.append({"title": r["title"], "url": r["url"], "method": how})
         progress(0.7 + 0.2 * (i + 1) / len(recs), "Checking PDFs...")
 
     w = PdfWriter()
-    w.append(PdfReader(io.BytesIO(make_cover(ok))))
-    for r, b in zip(ok, final):
-        start = len(w.pages)
+    w.append(PdfReader(io.BytesIO(make_cover(recs))), outline_item="Index")
+    for r, b, rp in zip(recs, final, report):
         try:
-            w.append(PdfReader(io.BytesIO(b)))
-            w.add_outline_item(clean(r["title"])[:90] or r["url"], start)
-        except Exception:
-            pass
+            w.append(PdfReader(io.BytesIO(b), strict=False), outline_item=(r["title"] or r["url"])[:90])
+        except Exception as e:
+            rp["method"] += f" - MERGE FAILED ({type(e).__name__})"
     merged = io.BytesIO()
     w.write(merged)
 
     zbuf = io.BytesIO()
     with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
-        for i, (r, b) in enumerate(zip(ok, final), 1):
+        for i, (r, b) in enumerate(zip(recs, final), 1):
             name = re.sub(r"[^\w\- ]+", "", r["title"])[:70].strip() or "position"
             z.writestr(f"{i:03d}_{name}.pdf", b)
-        z.writestr("positions.csv", recs_to_csv(ok))
+        z.writestr("positions.csv", recs_to_csv(recs))
+        z.writestr("processing_report.csv", pd.DataFrame(report).to_csv(index=False))
     progress(1.0, "Done")
-    return merged.getvalue(), zbuf.getvalue(), warn
+    return merged.getvalue(), zbuf.getvalue(), warn, pd.DataFrame(report)
 
 
-def recs_to_csv(recs):
-    s = io.StringIO()
-    wr = csv.writer(s)
-    wr.writerow(["title", "site", "organisation", "status", "deadline", "posted", "url"])
-    for r in recs:
-        wr.writerow([r["title"], r["site"], r["org"], r["status"], r["deadline"] or "", r["posted"] or "", r["url"]])
-    return s.getvalue()
+# ======================================================================================
+# 10. UI HELPERS
+# ======================================================================================
 
 
-# --------------------------------------------------------------------------------------
-# 6. UI
-# --------------------------------------------------------------------------------------
+def show_df(df, **kw):
+    try:
+        st.dataframe(df, hide_index=True, width="stretch", **kw)
+    except Exception:
+        st.dataframe(df, hide_index=True, use_container_width=True, **kw)
 
-st.set_page_config(page_title="PhD Position Finder", page_icon="🎓", layout="wide")
-st.title("🎓 PhD Position Finder & PDF Merger")
+
+def editor(df, **kw):
+    try:
+        return st.data_editor(df, hide_index=True, width="stretch", **kw)
+    except Exception:
+        return st.data_editor(df, hide_index=True, use_container_width=True, **kw)
+
+
+def csv_bytes(df):
+    return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def secret(name):
+    try:
+        v = st.secrets.get(name)
+    except Exception:
+        v = None
+    return v or os.environ.get(name, "")
+
+
+def merge_recs(new):
+    store = st.session_state.setdefault("recs", {})
+    for r in new:
+        store[r["canonical_url"]] = r
+
+
+def run_analysis(hits, bar=None, workers=8):
+    out = []
+    with ThreadPoolExecutor(workers) as ex:
+        futs = [ex.submit(analyze, h) for h in hits]
+        for j, fu in enumerate(as_completed(futs), 1):
+            out.append(fu.result())
+            if bar:
+                bar.progress(j / len(futs), f"Reading pages {j}/{len(futs)}")
+    return out
+
+
+# ======================================================================================
+# 11. APP
+# ======================================================================================
+
+init_db()
+st.title("🎓 PhD Position Finder, Skills Analyzer & PDF Merger")
 
 try:
     import playwright  # noqa: F401
@@ -456,11 +948,10 @@ try:
 except ImportError:
     PW_OK = False
 
-# ---------------- sidebar: sites + engine
+# ---------------- sidebar
 with st.sidebar:
     st.header("Websites")
-    selected_sites = []
-    by_region = {}
+    selected_sites, by_region = [], {}
     for s in SITES:
         by_region.setdefault(s.region, []).append(s)
     for reg in REGION_ORDER:
@@ -472,7 +963,7 @@ with st.sidebar:
                     selected_sites.append(s)
     custom = st.text_area("Custom sites / domains (one per line)", placeholder="jobs.ethz.ch\nuni-heidelberg.de")
     for line in custom.splitlines():
-        line = line.strip().replace("https://", "").replace("http://", "").strip("/")
+        line = re.sub(r"^https?://", "", line.strip()).strip("/")
         if line:
             selected_sites.append(Site(line, line, "Custom"))
 
@@ -480,20 +971,35 @@ with st.sidebar:
     engine = st.radio("Backend", ["DuckDuckGo (free, no key)", "Google Programmable Search (API)"])
     g_key = g_cx = ""
     if engine.startswith("Google"):
-        g_key = st.text_input("API key", type="password")
-        g_cx = st.text_input("Search engine ID (cx)")
-        st.caption("Set the engine to 'Search the entire web'. 100 free queries/day.")
+        g_key = st.text_input("API key", type="password", value=secret("GOOGLE_CSE_API_KEY"))
+        g_cx = st.text_input("Search engine ID (cx)", value=secret("GOOGLE_CSE_ID"))
+        st.caption("Set the engine to 'Search the entire web'. 100 free queries/day. "
+                   "Tip: put keys in .streamlit/secrets.toml or env vars.")
     per_site = st.slider("Max results per site", 5, 50, 20, 5)
+    max_pages = st.slider("Max pages to download per search", 20, 400, 150, 10)
+    pause = st.slider("Pause between DuckDuckGo queries (s)", 0.5, 5.0, 1.5, 0.5)
 
-# ---------------- main: keywords + filters
-c1, c2 = st.columns([3, 2])
+# ---------------- keywords
+def _apply_preset():
+    st.session_state["kw_text"] = KEYWORD_PRESETS[st.session_state["preset"]]
+
+
+c1, c2, c3 = st.columns([3, 2, 2])
 with c1:
-    kw_text = st.text_input("Keywords (comma-separated)", placeholder="reservoir, CO2 storage, geomechanics")
+    kw_text = st.text_input("Keywords (comma-separated)", key="kw_text",
+                            placeholder="reservoir, CO2 storage, geomechanics")
 with c2:
     mode = st.radio("Keyword logic", ["any", "all"], horizontal=True,
                     format_func=lambda x: "ANY keyword" if x == "any" else "ALL keywords")
+with c3:
+    st.selectbox("Preset keywords", list(KEYWORD_PRESETS), key="preset", on_change=_apply_preset)
 add_phd = st.checkbox('Add PhD terms ("PhD" / "doctoral") to every search query', value=True)
+with st.expander("Extra raw search queries (optional, run on the open web)"):
+    extra_text = st.text_area("One per line, used exactly as typed",
+                              placeholder='"PhD" "reservoir simulation" Europe 2026')
+KWS = [k.strip() for k in kw_text.split(",") if k.strip()]
 
+# ---------------- filters
 with st.expander("Filters (applied live to the results)", expanded=True):
     f1, f2, f3 = st.columns(3)
     with f1:
@@ -515,101 +1021,266 @@ FILTERS = dict(status=status, include_unknown=include_unknown, use_dates=use_dat
                start=start, end=end, require_phd=require_phd, require_kw=require_kw)
 
 # ---------------- search
-if st.button("🔍 Search", type="primary", disabled=not selected_sites):
-    kws = [k.strip() for k in kw_text.split(",") if k.strip()]
-    if not kws:
-        st.error("Enter at least one keyword.")
+extra_queries = [q.strip() for q in extra_text.splitlines() if q.strip()]
+sc1, sc2 = st.columns([1, 3])
+with sc1:
+    do_search = st.button("🔍 Search", type="primary", disabled=not (selected_sites or extra_queries))
+with sc2:
+    append = st.checkbox("Add to existing results instead of replacing them", value=False)
+
+if do_search:
+    if not KWS and not extra_queries:
+        st.error("Enter at least one keyword (or an extra query).")
         st.stop()
     if engine.startswith("Google") and not (g_key and g_cx):
         st.error("Google backend needs API key and cx.")
         st.stop()
+    jobs = []
+    if KWS:
+        for site in selected_sites:
+            code = COUNTRY_REGIONS.get(site.region, "")
+            jobs.append((site.name, build_query(site, KWS, mode, add_phd), code))
+    for q in extra_queries:
+        jobs.append(("Custom query", q, ""))
 
     hits, errors = {}, []
     bar = st.progress(0.0, "Searching...")
-    for i, site in enumerate(selected_sites):
-        q = build_query(site, kws, mode, add_phd)
-        bar.progress(i / len(selected_sites), f"Searching {site.name}  ->  {q}")
+    for i, (name, q, country) in enumerate(jobs):
+        bar.progress(i / len(jobs), f"Searching {name}  ->  {q}")
         try:
             res = search_ddg(q, per_site) if engine.startswith("Duck") else search_google(q, per_site, g_key, g_cx)
             for h in res:
                 if h["url"]:
-                    u = norm_url(h["url"])
-                    if u not in hits:
-                        hits[u] = {**h, "url": u, "site": site.name}
+                    u = canonicalize_url(h["url"])
+                    if u and u not in hits:
+                        hits[u] = {**h, "url": h["url"], "site": name, "country": country, "query": q}
         except Exception as e:
-            errors.append(f"{site.name}: {e}")
+            errors.append(f"{name}: {e}")
         if engine.startswith("Duck"):
-            time.sleep(1.5)  # be gentle, avoids rate limiting
-    recs = []
-    if hits:
-        with ThreadPoolExecutor(8) as ex:
-            futs = [ex.submit(analyze, h, kws, mode) for h in hits.values()]
-            for j, fu in enumerate(as_completed(futs), 1):
-                recs.append(fu.result())
-                bar.progress(j / len(futs), f"Reading pages {j}/{len(futs)}")
+            time.sleep(pause)
+    hit_list = list(hits.values())[:max_pages]
+    if len(hits) > max_pages:
+        errors.append(f"{len(hits)} URLs found; only the first {max_pages} were downloaded (see sidebar slider).")
+    new = run_analysis(hit_list, bar) if hit_list else []
     bar.empty()
-    st.session_state["recs"] = recs
+    if not append:
+        st.session_state["recs"] = {}
+    merge_recs(new)
+    saved = save_records(new)
     st.session_state["errors"] = errors
+    st.session_state["notice"] = f"Analysed {len(new)} pages, saved {saved} to the local database."
     st.session_state.pop("outputs", None)
 
 for e in st.session_state.get("errors", []):
     st.warning(e)
+if st.session_state.get("notice"):
+    st.info(st.session_state["notice"])
 
-# ---------------- results
-recs = st.session_state.get("recs")
-if recs is not None:
-    shown = [r for r in recs if passes(r, FILTERS)]
-    shown.sort(key=lambda r: (r["deadline"] is None, r["deadline"] or dt.date.max))
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Found", len(recs))
-    m2.metric("After filters", len(shown))
-    m3.metric("Open", sum(r["status"] == "open" for r in shown))
-    m4.metric("Closed", sum(r["status"] == "closed" for r in shown))
+# ---------------- working set
+all_recs = list(st.session_state.get("recs", {}).values())
+refresh_flags(all_recs, KWS, mode)
+shown = [r for r in all_recs if passes(r, FILTERS)]
+shown.sort(key=lambda r: (r["deadline"] is None, r["deadline"] or dt.date.max))
+chosen = []
 
-    if not shown:
-        st.info("Nothing matches the current filters - try loosening them (they apply instantly).")
+tab_res, tab_skill, tab_db, tab_add, tab_notes = st.tabs(
+    ["📋 Results & PDF pack", "🧠 Skills analysis", "🗃️ Saved database", "➕ Add URLs / PDFs", "ℹ️ Notes"])
+
+# ====================== results + PDF
+with tab_res:
+    if not all_recs:
+        st.info("No results yet - pick sites, enter keywords and press Search (or load saved records / add URLs).")
     else:
-        df = pd.DataFrame([{
-            "Select": True, "Title": r["title"], "Site": r["site"], "Organisation": r["org"],
-            "Status": r["status"], "Deadline": str(r["deadline"] or ""), "Posted": str(r["posted"] or ""),
-            "URL": r["url"]} for r in shown])
-        edited = st.data_editor(
-            df, hide_index=True, use_container_width=True,
-            key="ed_" + str(hash(tuple(df["URL"]))),
-            column_config={"Select": st.column_config.CheckboxColumn(width="small"),
-                           "URL": st.column_config.LinkColumn("URL", width="medium")},
-            disabled=[c for c in df.columns if c != "Select"])
-        chosen_urls = set(edited.loc[edited["Select"], "URL"])
-        chosen = [r for r in shown if r["url"] in chosen_urls]
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Found", len(all_recs))
+        m2.metric("After filters", len(shown))
+        m3.metric("Open", sum(r["status"] == "open" for r in shown))
+        m4.metric("Closed", sum(r["status"] == "closed" for r in shown))
+        if not shown:
+            st.info("Nothing matches the current filters - try loosening them (they apply instantly).")
+        else:
+            pre = st.checkbox("Pre-tick all rows", value=True)
+            df = pd.DataFrame([{
+                "Select": pre, "Title": r["title"], "Site": r["site"], "Organisation": r["org"],
+                "Status": r["status"], "Deadline": str(r["deadline"] or ""),
+                "Deadline source": r["deadline_source"], "Posted": str(r["posted"] or ""),
+                "Note": ("page not readable - snippet only" if r["error"] else ""), "URL": r["url"]}
+                for r in shown])
+            edited = editor(
+                df, key="ed_" + hashlib.md5(("|".join(df["URL"]) + str(pre)).encode()).hexdigest(),
+                column_config={"Select": st.column_config.CheckboxColumn(width="small"),
+                               "URL": st.column_config.LinkColumn("URL", width="medium")},
+                disabled=[c for c in df.columns if c != "Select"])
+            chosen_urls = set(edited.loc[edited["Select"], "URL"])
+            chosen = [r for r in shown if r["url"] in chosen_urls]
 
-        b1, b2 = st.columns([2, 3])
-        with b1:
-            use_pw = st.checkbox("High-quality rendering (Playwright / headless Chrome)", value=PW_OK,
-                                 disabled=not PW_OK,
-                                 help="pip install playwright && playwright install chromium")
-            if st.button(f"📄 Build merged PDF ({len(chosen)} selected)", type="primary", disabled=not chosen):
-                pb = st.progress(0.0, "Starting...")
-                merged, zipped, warn = build_outputs(chosen, use_pw, lambda v, t: pb.progress(min(v, 1.0), t))
-                st.session_state["outputs"] = dict(merged=merged, zipped=zipped, csv=recs_to_csv(chosen))
-                if warn:
-                    st.warning(warn)
-                pb.empty()
+            b1, b2 = st.columns([2, 3])
+            with b1:
+                use_pw = st.checkbox("High-quality rendering (Playwright / headless Chrome)", value=PW_OK,
+                                     disabled=not PW_OK,
+                                     help="pip install playwright && playwright install chromium")
+                if st.button(f"📄 Build merged PDF ({len(chosen)} selected)", type="primary", disabled=not chosen):
+                    pb = st.progress(0.0, "Starting...")
+                    merged, zipped, warn, report = build_outputs(
+                        chosen, use_pw, lambda v, t: pb.progress(min(v, 1.0), t))
+                    st.session_state["outputs"] = dict(merged=merged, zipped=zipped, csv=recs_to_csv(chosen),
+                                                       report=report)
+                    if warn:
+                        st.warning(warn)
+                    pb.empty()
+            out = st.session_state.get("outputs")
+            if out:
+                with b2:
+                    st.success("Ready!")
+                    d1, d2, d3 = st.columns(3)
+                    d1.download_button("⬇️ Merged PDF", out["merged"], "phd_positions_merged.pdf", "application/pdf")
+                    d2.download_button("⬇️ ZIP (PDFs + CSVs)", out["zipped"], "phd_positions.zip", "application/zip")
+                    d3.download_button("⬇️ CSV list", out["csv"], "phd_positions.csv", "text/csv")
+                with st.expander("How each PDF was produced"):
+                    show_df(out["report"])
 
-        out = st.session_state.get("outputs")
-        if out:
-            with b2:
-                st.success("Ready!")
-                d1, d2, d3 = st.columns(3)
-                d1.download_button("⬇️ Merged PDF", out["merged"], "phd_positions_merged.pdf", "application/pdf")
-                d2.download_button("⬇️ ZIP (separate PDFs + CSV)", out["zipped"], "phd_positions.zip", "application/zip")
-                d3.download_button("⬇️ CSV list", out["csv"], "phd_positions.csv", "text/csv")
+# ====================== skills
+with tab_skill:
+    st.subheader("Which skills recur across these vacancies?")
+    scope = st.radio("Analyse", ["All filtered rows", "Only ticked rows"], horizontal=True)
+    pool = chosen if (scope == "Only ticked rows" and chosen) else shown
+    pool = [r for r in pool if r["text"]]
+    st.caption(f"{len(pool)} vacancies analysed. Counts describe THIS sample, not Europe-wide prevalence. "
+               "Cue labels are keyword/context heuristics - audit the evidence snippets.")
+    if not pool:
+        st.info("Run a search first (or relax the filters).")
+    else:
+        summ, terms, evd = analyze_skills(pool)
+        if summ.empty:
+            st.info("No skill terms from the taxonomy were found in the page texts.")
+        else:
+            show_df(summ)
+            st.bar_chart(summ.set_index("Skill area")[["Vacancies mentioning"]])
+            st.markdown("**Most frequent specific terms / tools**")
+            show_df(terms.head(40))
+            st.markdown("**Evidence snippets**")
+            area = st.multiselect("Filter evidence by skill area", list(summ["Skill area"]))
+            show_df(evd[evd["Skill area"].isin(area)] if area else evd)
+            k1, k2, k3 = st.columns(3)
+            k1.download_button("⬇️ Skill summary CSV", csv_bytes(summ), "skill_summary.csv", "text/csv")
+            k2.download_button("⬇️ Term frequency CSV", csv_bytes(terms), "skill_terms.csv", "text/csv")
+            k3.download_button("⬇️ Evidence CSV", csv_bytes(evd), "skill_evidence.csv", "text/csv")
 
-with st.expander("Notes & tips"):
+# ====================== database
+with tab_db:
+    st.subheader("Saved positions (local SQLite)")
+    st.caption(f"File: `{DB_PATH.resolve()}`")
+    saved_recs = load_db_records()
+    refresh_flags(saved_recs, KWS, mode)
+    if not saved_recs:
+        st.info("Nothing saved yet. Every successful search is stored automatically.")
+    else:
+        q1, q2, q3 = st.columns(3)
+        needle = q1.text_input("Search title / organisation / text").lower().strip()
+        all_rs = sorted({r["review_status"] for r in saved_recs} | {"Needs review"})
+        rs = q2.multiselect("Review status", all_rs, default=all_rs)
+        only_phd = q3.checkbox("Only likely PhD positions", value=True)
+        view = [r for r in saved_recs
+                if r["review_status"] in rs and (r["has_phd"] or not only_phd)
+                and (not needle or needle in (r["title"] + r["org"] + r["text"]).lower())]
+        st.caption(f"{len(view)} of {len(saved_recs)} saved records match.")
+        dfv = pd.DataFrame([{"Title": r["title"], "Organisation": r["org"], "Site": r["site"],
+                             "Country": r["country"], "Status": r["status"], "Deadline": str(r["deadline"] or ""),
+                             "Deadline source": r["deadline_source"], "Review": r["review_status"],
+                             "URL": r["url"]} for r in view])
+        show_df(dfv, column_config={"URL": st.column_config.LinkColumn("URL")})
+        a1, a2 = st.columns(2)
+        if a1.button("⬆️ Load these records into Results / PDF / Skills", disabled=not view):
+            merge_recs(view)
+            st.session_state["notice"] = f"Loaded {len(view)} saved records into the results table."
+            st.rerun()
+        a2.download_button("⬇️ Export listed records (CSV)", csv_bytes(dfv), "saved_positions.csv", "text/csv")
+
+        if view:
+            st.markdown("**Review a record**")
+            rec = st.selectbox("Record", view, format_func=lambda r: f"{r['title'][:80]} - {r['org'][:40]}")
+            with st.form("review_form"):
+                st.write(f"Source: {rec['url']}")
+                opts = ["Needs review", "Verified open", "Verified closed", "Not relevant", "Duplicate",
+                        "Applied", "Contacted"]
+                cur = rec["review_status"] if rec["review_status"] in opts else "Needs review"
+                new_status = st.selectbox("Review status", opts, index=opts.index(cur))
+                man = st.text_input("Manually verified deadline (YYYY-MM-DD, blank = unchanged)")
+                ok = st.form_submit_button("Save")
+            if ok:
+                db_update_review(rec["canonical_url"], new_status)
+                if man.strip():
+                    d = s2d(man.strip())
+                    if d:
+                        db_set_deadline(rec["canonical_url"], d)
+                    else:
+                        st.warning("Deadline not saved - use YYYY-MM-DD.")
+                st.success("Saved.")
+                st.rerun()
+
+        with st.expander("Danger zone"):
+            if st.checkbox("I understand: permanently delete the listed records") and st.button("Delete listed records"):
+                db_delete([r["canonical_url"] for r in view])
+                st.rerun()
+
+# ====================== add URLs / PDFs
+with tab_add:
+    st.subheader("Add known vacancy URLs")
+    url_text = st.text_area("One URL per line", height=140, placeholder="https://university.example/jobs/phd-position")
+    if st.button("Extract pasted URLs", type="primary"):
+        urls = list(dict.fromkeys(u.strip() for u in url_text.splitlines() if u.strip()))
+        if urls:
+            hits = [{"url": u, "title": "", "snippet": "", "site": "Manual URL", "country": "",
+                     "query": "Manual URL import"} for u in urls]
+            bar = st.progress(0.0, "Reading pages...")
+            new = run_analysis(hits, bar, workers=6)
+            bar.empty()
+            merge_recs(new)
+            n = save_records(new)
+            bad = [r for r in new if r["error"]]
+            st.session_state["notice"] = f"Added {len(new)} URLs ({n} saved, {len(bad)} unreadable)."
+            st.rerun()
+    st.divider()
+    st.subheader("Upload vacancy PDFs")
+    ups = st.file_uploader("PDF advertisements", type=["pdf"], accept_multiple_files=True)
+    if ups and st.button("Add uploaded PDFs to results"):
+        new = []
+        for f in ups:
+            try:
+                data = f.getvalue()
+                if len(data) > MAX_BYTES:
+                    raise ValueError("file larger than 25 MB")
+                rd = PdfReader(io.BytesIO(data), strict=False)
+                r = new_rec("upload://" + f.name, {"title": f.name.rsplit(".", 1)[0], "site": "Upload"})
+                r.update(canonical_url="upload:" + hashlib.sha1(data).hexdigest()[:12], is_pdf=True,
+                         content=data, upload=True,
+                         text="\n".join((p.extract_text() or "") for p in rd.pages[:6]))
+                r["has_phd"] = phd_flag(r["title"], r["text"])
+                dl = labeled_date(re.sub(r"\s+", " ", r["text"]), DEADLINE_LABEL)
+                if dl:
+                    r["deadline"], r["deadline_source"] = dl, "Text near deadline label (verify)"
+                r["status"] = compute_status(r["deadline"])
+                new.append(r)
+            except Exception as e:
+                st.error(f"{f.name}: {type(e).__name__}: {e}")
+        if new:
+            merge_recs(new)
+            st.session_state["notice"] = f"Added {len(new)} uploaded PDFs (session only, not saved to the database)."
+            st.rerun()
+
+# ====================== notes
+with tab_notes:
     st.markdown("""
-- **Dates are detected automatically** (structured data first, then text patterns like *"Application deadline: 15 Nov 2026"*).
-  When no date can be found the position is marked *unknown* - use the checkbox to keep or drop those.
-- Search engines don't know the real posting date, so the interval filter works on the dates read from the page itself.
-- Use the *"All ... universities"* entries (`edu.au`, `ac.nz`, `ac.uk`, `.edu`) to cover whole countries' university sites at once.
-- If DuckDuckGo rate-limits you, wait a minute, tick fewer sites, or switch to the Google API backend.
-- Cookie banners may appear on some rendered pages; the text of the position is still included.
+- **Dates** are read from structured data (JSON-LD `validThrough`) first, then from text next to labels like
+  *"Application deadline: 15 Nov 2026"*. The *Deadline source* column tells you which; `validThrough` is sometimes the
+  posting's validity, not the real deadline. Use the *Saved database* tab to enter a verified deadline.
+- Search engines don't know posting dates, so the interval filter uses dates read from the page itself.
+  Positions with no detectable date are kept or dropped with the *"couldn't detect"* checkbox.
+- Skills analysis counts keyword mentions; "Required cue / Preferred cue" is a context heuristic, not understanding.
+  Always check the evidence snippets. Counts are for your sample, not for Europe as a whole.
+- `All ... universities` entries (`edu.au`, `ac.nz`, `ac.uk`, `.edu`) cover whole countries at once but return noisier hits.
+- If DuckDuckGo rate-limits you, wait a minute, tick fewer sites, increase the pause, or use the Google API backend.
+- Pages that could not be read (login walls, bot protection) show *snippet only* and are not saved to the database.
+- Downloads block private/local addresses and cap file size, but this is a personal tool, not a hardened public service.
+- Cookie banners may appear on rendered pages; the position text is still included.
 """)
