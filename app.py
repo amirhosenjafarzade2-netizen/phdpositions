@@ -342,22 +342,25 @@ def build_query(site: Site, kws, mode, add_phd):
     return " ".join(p for p in parts if p)
 
 
-def search_ddg(q, n):
+def search_ddg(q, n, backend="auto"):
+    """ddgs meta-search. backend: "auto"/"duckduckgo" or "google" (direct Google, no API key)."""
     try:
         from ddgs import DDGS
     except ImportError:
         from duckduckgo_search import DDGS
     last = None
-    for attempt in range(3):
+    tries = 2 if backend == "google" else 3
+    for attempt in range(tries):
         try:
             with DDGS() as d:
-                res = d.text(q, max_results=n)
+                res = d.text(q, max_results=n, backend=backend) if backend != "auto" else d.text(q, max_results=n)
             return [{"url": r.get("href") or r.get("url"), "title": r.get("title", ""),
                      "snippet": r.get("body", "")} for r in res]
         except Exception as e:
             last = e
             time.sleep(3 * (attempt + 1))
-    raise RuntimeError(f"DuckDuckGo failed: {last}")
+    hint = " (Google probably blocked this request - wait, search less, or use the API)" if backend == "google" else ""
+    raise RuntimeError(f"{backend} search failed: {last}{hint}")
 
 
 def search_google(q, n, key, cx):
@@ -968,16 +971,22 @@ with st.sidebar:
             selected_sites.append(Site(line, line, "Custom"))
 
     st.header("Search engine")
-    engine = st.radio("Backend", ["DuckDuckGo (free, no key)", "Google Programmable Search (API)"])
+    engine = st.radio("Backend", ["Google direct (no key, may get blocked)",
+                                  "DuckDuckGo (free, no key)",
+                                  "Google Programmable Search (API - closed to new users)"])
+    use_api = engine.startswith("Google Programmable")
     g_key = g_cx = ""
-    if engine.startswith("Google"):
+    if engine.startswith("Google direct"):
+        st.caption("Scrapes Google results through the ddgs library. If Google blocks a query, the app "
+                   "automatically retries that query on DuckDuckGo. Keep result counts low and the pause at 3 s or more.")
+    if use_api:
         g_key = st.text_input("API key", type="password", value=secret("GOOGLE_CSE_API_KEY"))
         g_cx = st.text_input("Search engine ID (cx)", value=secret("GOOGLE_CSE_ID"))
         st.caption("Set the engine to 'Search the entire web'. 100 free queries/day. "
                    "Tip: put keys in .streamlit/secrets.toml or env vars.")
     per_site = st.slider("Max results per site", 5, 50, 20, 5)
     max_pages = st.slider("Max pages to download per search", 20, 400, 150, 10)
-    pause = st.slider("Pause between DuckDuckGo queries (s)", 0.5, 5.0, 1.5, 0.5)
+    pause = st.slider("Pause between queries (s)", 0.5, 10.0, 3.0, 0.5)
 
 # ---------------- keywords
 def _apply_preset():
@@ -1032,7 +1041,7 @@ if do_search:
     if not KWS and not extra_queries:
         st.error("Enter at least one keyword (or an extra query).")
         st.stop()
-    if engine.startswith("Google") and not (g_key and g_cx):
+    if use_api and not (g_key and g_cx):
         st.error("Google backend needs API key and cx.")
         st.stop()
     jobs = []
@@ -1048,7 +1057,16 @@ if do_search:
     for i, (name, q, country) in enumerate(jobs):
         bar.progress(i / len(jobs), f"Searching {name}  ->  {q}")
         try:
-            res = search_ddg(q, per_site) if engine.startswith("Duck") else search_google(q, per_site, g_key, g_cx)
+            if use_api:
+                res = search_google(q, per_site, g_key, g_cx)
+            elif engine.startswith("Google direct"):
+                try:
+                    res = search_ddg(q, per_site, "google")
+                except Exception as ge:
+                    errors.append(f"{name}: Google blocked/failed - used DuckDuckGo instead ({str(ge)[:90]})")
+                    res = search_ddg(q, per_site, "auto")
+            else:
+                res = search_ddg(q, per_site, "auto")
             for h in res:
                 if h["url"]:
                     u = canonicalize_url(h["url"])
@@ -1056,7 +1074,7 @@ if do_search:
                         hits[u] = {**h, "url": h["url"], "site": name, "country": country, "query": q}
         except Exception as e:
             errors.append(f"{name}: {e}")
-        if engine.startswith("Duck"):
+        if not use_api:
             time.sleep(pause)
     hit_list = list(hits.values())[:max_pages]
     if len(hits) > max_pages:
@@ -1279,7 +1297,7 @@ with tab_notes:
 - Skills analysis counts keyword mentions; "Required cue / Preferred cue" is a context heuristic, not understanding.
   Always check the evidence snippets. Counts are for your sample, not for Europe as a whole.
 - `All ... universities` entries (`edu.au`, `ac.nz`, `ac.uk`, `.edu`) cover whole countries at once but return noisier hits.
-- If DuckDuckGo rate-limits you, wait a minute, tick fewer sites, increase the pause, or use the Google API backend.
+- Google direct scrapes Google through `ddgs`; when Google blocks a query the app falls back to DuckDuckGo for it (see the warnings). If blocks persist, wait a few minutes, tick fewer sites and increase the pause.
 - Pages that could not be read (login walls, bot protection) show *snippet only* and are not saved to the database.
 - Downloads block private/local addresses and cap file size, but this is a personal tool, not a hardened public service.
 - Cookie banners may appear on rendered pages; the position text is still included.
