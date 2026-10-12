@@ -398,12 +398,13 @@ def search_engine(q, n, backend):
 
     _patch_ddgs_google()
     valid = available_text_backends()
-    if valid and backend not in valid:
+    # The package's auto mode can choose among providers instead of relying on one.
+    if backend != "auto" and valid and backend not in valid:
         raise RuntimeError(f"Backend '{backend}' is not supported by this ddgs version. Available: {', '.join(sorted(valid))}")
 
-    region = "wt-wt" if backend == "duckduckgo" else "us-en"
+    # Avoid forcing US-only results; selected domains are checked locally afterward.
     with DDGS() as d:
-        results = d.text(q, region=region, max_results=n, backend=backend)
+        results = d.text(q, region="wt-wt", max_results=n, backend=backend)
 
     out = []
     for result in results or []:
@@ -424,8 +425,8 @@ def search_engine(q, n, backend):
 # Try multiple explicit providers. The installed ddgs package may not support every backend;
 # unsupported backends are recorded in diagnostics and skipped without disabling other engines.
 SEARCH_CHAINS = {
-    "google": ["google", "duckduckgo", "brave", "bing", "mojeek"],
-    "duckduckgo": ["duckduckgo", "brave", "google", "bing", "mojeek"],
+    "google": ["auto", "google", "duckduckgo", "brave", "bing", "mojeek"],
+    "duckduckgo": ["auto", "duckduckgo", "brave", "google", "bing", "mojeek"],
 }
 
 
@@ -436,7 +437,7 @@ def search_chain(q, n, first, dead=None, siteq=""):
     candidates = SEARCH_CHAINS.get(first, [first])
     valid = available_text_backends()
     if valid:
-        candidates = [backend for backend in candidates if backend in valid]
+        candidates = [backend for backend in candidates if backend == "auto" or backend in valid]
     if not candidates:
         return [], [("ddgs", 0, "ERROR: no compatible text backend; upgrade ddgs in requirements.txt")]
 
@@ -484,9 +485,10 @@ def query_variants(site, kws, mode, add_phd):
     phd = PHD_TERMS if add_phd else ""
     if host:
         variants.append(" ".join(p for p in [f"site:{host}", phd, first_kw] if p))
-        # Third attempt searches the host without requiring PhD wording, useful when the listing title
-        # uses a local-language or alternative doctoral title.
         variants.append(" ".join(p for p in [f"site:{host}", first_kw] if p))
+        # Broaden the engine query but keep the local domain check in search_chain.
+        variants.append(" ".join(p for p in [phd, first_kw] if p))
+        variants.append(" ".join(clean_kws))
     else:
         variants.append(" ".join(p for p in [phd, first_kw] if p))
         variants.append(" ".join(clean_kws))
@@ -592,7 +594,7 @@ def new_rec(url, hit=None):
     return dict(url=url, canonical_url=canonicalize_url(url) or url, title=hit.get("title", ""),
                 site=hit.get("site", ""), org="", location="", country=hit.get("country", ""),
                 posted=None, deadline=None, deadline_source="", status="unknown", is_pdf=False,
-                content=None, text="", has_phd=False, has_kw=False,
+                content=None, text="", snippet=hit.get("snippet", ""), has_phd=False, has_kw=False,
                 search_query=hit.get("query", ""), review_status="Needs review", error="",
                 upload=False)
 
@@ -661,9 +663,9 @@ def analyze(hit):
         rec["error"] = f"{type(e).__name__}: {str(e)[:150]}"
         rec["text"] = hit.get("snippet", "")
 
-    blob = rec["title"] + "\n" + rec["text"]
+    blob = rec["title"] + "\n" + rec["text"] + "\n" + rec.get("snippet", "")
     flat = re.sub(r"\s+", " ", blob[:60000])
-    rec["has_phd"] = phd_flag(rec["title"], rec["text"] or hit.get("snippet", ""))
+    rec["has_phd"] = phd_flag(rec["title"], rec["text"] + "\n" + rec.get("snippet", ""))
     if not rec["deadline"]:
         rec["deadline"] = labeled_date(flat, DEADLINE_LABEL)
         if rec["deadline"]:
@@ -678,7 +680,7 @@ def analyze(hit):
 def refresh_flags(recs, kws, mode):
     """Keyword match is recomputed live, so changing keywords re-filters instantly."""
     for r in recs:
-        blob = (r["title"] + "\n" + r["text"]).lower()
+        blob = (r["title"] + "\n" + r["text"] + "\n" + r.get("snippet", "")).lower()
         r["has_kw"] = keyword_hit(blob, kws, mode)
         if r["deadline"]:
             r["status"] = compute_status(r["deadline"])
@@ -1124,10 +1126,10 @@ with st.sidebar:
     max_pages = st.slider("Max pages to download per search", 20, 400, 150, 10)
     pause = st.slider("Pause between queries (s)", 0.5, 10.0, 3.0, 0.5)
     if st.button("🧪 Test search engines & downloads"):
-        test_backends = ["google", "duckduckgo", "brave", "bing", "mojeek"]
+        test_backends = ["auto", "google", "duckduckgo", "brave", "bing", "mojeek"]
         supported = available_text_backends()
         if supported:
-            test_backends = [b for b in test_backends if b in supported]
+            test_backends = [b for b in test_backends if b == "auto" or b in supported]
         if not test_backends:
             st.error("The installed ddgs package exposes no compatible text backends. Upgrade ddgs and redeploy.")
         for backend in test_backends:
@@ -1299,9 +1301,10 @@ with tab_res:
             n_nokw = sum(not r["has_kw"] for r in all_recs)
             n_closed = sum(r["status"] == "closed" for r in all_recs)
             n_err = sum(bool(r["error"]) for r in all_recs)
-            st.info(f"Nothing matches the current filters (they apply instantly). Of {len(all_recs)} pages: "
+            st.info(f"Search found {len(all_recs)} page(s), but none pass the current filters. Of these pages: "
                     f"{n_nophd} lack PhD terms, {n_nokw} lack your keywords, {n_closed} look closed, "
-                    f"{n_err} could not be downloaded. Untick the matching filter(s) to see them.")
+                    f"{n_err} could not be downloaded. Temporarily untick the PhD and keyword requirements "
+                    f"and choose 'Open + closed' to diagnose filters.")
         else:
             pre = st.checkbox("Pre-tick all rows", value=True)
             df = pd.DataFrame([{
