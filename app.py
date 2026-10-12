@@ -228,6 +228,9 @@ RANK = {"Required cue": 4, "Preferred cue": 3, "Mentioned only": 2, "Negated": 1
 # ======================================================================================
 
 
+FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
 @lru_cache(maxsize=1024)
 def is_public_host(host: str) -> bool:
     try:
@@ -239,6 +242,8 @@ def is_public_host(host: str) -> bool:
             ip = ipaddress.ip_address(info[4][0].split("%")[0])
         except ValueError:
             return False
+        if ip in FAKE_IP_NET:  # VPN/proxy "fake-ip" DNS (198.18.0.0/15) - not a real private network
+            continue
         if (ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
                 or ip.is_multicast or ip.is_unspecified):
             return False
@@ -342,25 +347,98 @@ def build_query(site: Site, kws, mode, add_phd):
     return " ".join(p for p in parts if p)
 
 
-def search_ddg(q, n, backend="auto"):
-    """ddgs meta-search. backend: "auto"/"duckduckgo" or "google" (direct Google, no API key)."""
+def _patch_ddgs_google():
+    """ddgs' Google backend adds cr=countryUS & lr=lang_en, which hides every non-US/non-English site
+    (jobbnorge.no, .nl, .ac.uk ...). Remove those two restrictions."""
+    try:
+        from ddgs.engines.google import Google
+        orig = Google.build_payload
+        if getattr(orig, "_patched", False):
+            return
+
+        def build_payload(self, *a, **k):
+            pl = orig(self, *a, **k)
+            pl.pop("cr", None)
+            pl.pop("lr", None)
+            return pl
+        build_payload._patched = True
+        Google.build_payload = build_payload
+    except Exception:
+        pass
+
+
+def search_engine(q, n, backend):
+    """Query ONE explicit ddgs backend. Never use 'auto': it puts Wikipedia/Grokipedia first and
+    those engines ignore site: operators, so real job pages get crowded out."""
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
-    last = None
-    tries = 2 if backend == "google" else 3
-    for attempt in range(tries):
+        raise RuntimeError("Package 'ddgs' is missing or too old: pip install -U ddgs")
+    _patch_ddgs_google()
+    try:  # an unknown backend makes ddgs silently fall back to 'auto' (Wikipedia first) - refuse that
+        from ddgs.engines import ENGINES
+        valid = set(ENGINES["text"])
+        if backend not in valid:
+            raise RuntimeError(f"backend '{backend}' not available in this ddgs version (valid: {', '.join(sorted(valid))})")
+    except ImportError:
+        pass
+    region = "wt-wt" if backend == "duckduckgo" else "us-en"
+    with DDGS() as d:
+        res = d.text(q, region=region, max_results=n, backend=backend)
+    out = []
+    for r in (res or []):
+        u = r.get("href") or r.get("url")
+        if not u or re.search(r"//[a-z.]*(wikipedia|grokipedia)\.", u):
+            continue
+        out.append({"url": u, "title": r.get("title", ""), "snippet": r.get("body", ""), "engine": backend})
+    return out
+
+
+SEARCH_CHAINS = {"google": ["google", "duckduckgo", "brave"], "duckduckgo": ["duckduckgo", "brave", "startpage"]}
+
+
+def search_chain(q, n, first, dead=None):
+    """Try engines in order until one returns results. `dead` = engines that already errored this run
+    (blocked/CAPTCHA) and are skipped. -> (results, notes[(engine, count, note)])"""
+    notes = []
+    for b in SEARCH_CHAINS.get(first, [first]):
+        if dead is not None and b in dead:
+            continue
         try:
-            with DDGS() as d:
-                res = d.text(q, max_results=n, backend=backend) if backend != "auto" else d.text(q, max_results=n)
-            return [{"url": r.get("href") or r.get("url"), "title": r.get("title", ""),
-                     "snippet": r.get("body", "")} for r in res]
+            res = search_engine(q, n, b)
+            notes.append((b, len(res), ""))
+            if res:
+                return res, notes
         except Exception as e:
-            last = e
-            time.sleep(3 * (attempt + 1))
-    hint = " (Google probably blocked this request - wait, search less, or use the API)" if backend == "google" else ""
-    raise RuntimeError(f"{backend} search failed: {last}{hint}")
+            msg = str(e)
+            notes.append((b, 0, "no results" if "No results" in msg else "ERROR: " + msg[:130]))
+            if dead is not None and "No results" not in msg:
+                dead.add(b)
+        time.sleep(1.0)
+    return [], notes
+
+
+def url_matches_site(url, siteq):
+    """Some engines ignore site:. Keep only hits on the requested domain."""
+    dom = siteq.split("/")[0].lower().strip()
+    host = (urlparse(url).hostname or "").lower()
+    return bool(dom) and (host == dom or host.endswith("." + dom))
+
+
+def query_variants(site, kws, mode, add_phd):
+    """Strict query first; looser ones are only used if the strict one returns nothing."""
+    out = [build_query(site, kws, mode, add_phd)]
+    base = f"site:{site.query} " if site.query else ""
+    k1 = kws[0]
+    out.append(f'{base}PhD "{k1}"')
+    host_only = f"site:{site.query.split('/')[0]} " if site.query else ""
+    out.append(f"{host_only}PhD {k1}")
+    seen, uniq = set(), []
+    for q in out:
+        if q not in seen:
+            seen.add(q)
+            uniq.append(q)
+    return uniq
 
 
 def search_google(q, n, key, cx):
@@ -987,6 +1065,18 @@ with st.sidebar:
     per_site = st.slider("Max results per site", 5, 50, 20, 5)
     max_pages = st.slider("Max pages to download per search", 20, 400, 150, 10)
     pause = st.slider("Pause between queries (s)", 0.5, 10.0, 3.0, 0.5)
+    if st.button("🧪 Test search engines & downloads"):
+        for b in ["google", "duckduckgo", "brave", "startpage"]:
+            try:
+                n_ = len(search_engine("site:jobbnorge.no PhD", 5, b))
+                st.write(f"{'✅' if n_ else '⚠️'} {b}: {n_} results")
+            except Exception as e:
+                st.write(f"❌ {b}: {str(e)[:140]}")
+        try:
+            safe_get("https://www.jobbnorge.no/en/available-jobs")
+            st.write("✅ page download works")
+        except Exception as e:
+            st.write(f"❌ page download: {type(e).__name__}: {str(e)[:140]}")
 
 # ---------------- keywords
 def _apply_preset():
@@ -1048,34 +1138,48 @@ if do_search:
     if KWS:
         for site in selected_sites:
             code = COUNTRY_REGIONS.get(site.region, "")
-            jobs.append((site.name, build_query(site, KWS, mode, add_phd), code))
+            jobs.append((site.name, query_variants(site, KWS, mode, add_phd), code, site.query))
     for q in extra_queries:
-        jobs.append(("Custom query", q, ""))
+        jobs.append(("Custom query", [q], "", ""))
 
-    hits, errors = {}, []
+    hits, errors, slog, empty_sites, dead = {}, [], [], [], set()
+    first_engine = "google" if engine.startswith("Google direct") else "duckduckgo"
     bar = st.progress(0.0, "Searching...")
-    for i, (name, q, country) in enumerate(jobs):
-        bar.progress(i / len(jobs), f"Searching {name}  ->  {q}")
-        try:
+    for i, (name, variants, country, siteq) in enumerate(jobs):
+        bar.progress(i / len(jobs), f"Searching {name}")
+        got = []
+        for vi, q in enumerate(variants, 1):
             if use_api:
-                res = search_google(q, per_site, g_key, g_cx)
-            elif engine.startswith("Google direct"):
                 try:
-                    res = search_ddg(q, per_site, "google")
-                except Exception as ge:
-                    errors.append(f"{name}: Google blocked/failed - used DuckDuckGo instead ({str(ge)[:90]})")
-                    res = search_ddg(q, per_site, "auto")
+                    got, notes = search_google(q, per_site, g_key, g_cx), []
+                    notes = [("google-api", len(got), "")]
+                except Exception as e:
+                    got, notes = [], [("google-api", 0, "ERROR: " + str(e)[:130])]
             else:
-                res = search_ddg(q, per_site, "auto")
-            for h in res:
-                if h["url"]:
-                    u = canonicalize_url(h["url"])
-                    if u and u not in hits:
-                        hits[u] = {**h, "url": h["url"], "site": name, "country": country, "query": q}
-        except Exception as e:
-            errors.append(f"{name}: {e}")
+                got, notes = search_chain(q, per_site, first_engine, dead)
+            raw_n = len(got)
+            if siteq:
+                got = [h for h in got if url_matches_site(h["url"], siteq)]
+            for eng, n_, note in notes:
+                slog.append({"Site": name, "Try": vi, "Query": q, "Engine": eng, "Results": n_,
+                             "Note": note + (f" ({raw_n - len(got)} off-site dropped)" if raw_n != len(got) and n_ else "")})
+            if got:
+                break
+            time.sleep(min(pause, 1.5))
+        if not got:
+            empty_sites.append(name)
+        for h in got:
+            u = canonicalize_url(h["url"])
+            if u and u not in hits:
+                hits[u] = {**h, "site": name, "country": country, "query": variants[0]}
         if not use_api:
             time.sleep(pause)
+    if dead:
+        errors.append("Engine(s) blocked or failing this run and skipped afterwards: " + ", ".join(sorted(dead))
+                      + " (use the sidebar test button for details)")
+    if empty_sites:
+        errors.append("No results for: " + ", ".join(empty_sites[:12]) + (" ..." if len(empty_sites) > 12 else "")
+                      + "  (see Search diagnostics below)")
     hit_list = list(hits.values())[:max_pages]
     if len(hits) > max_pages:
         errors.append(f"{len(hits)} URLs found; only the first {max_pages} were downloaded (see sidebar slider).")
@@ -1086,13 +1190,24 @@ if do_search:
     merge_recs(new)
     saved = save_records(new)
     st.session_state["errors"] = errors
-    st.session_state["notice"] = f"Analysed {len(new)} pages, saved {saved} to the local database."
+    ok_n = sum(1 for r in new if not r["error"])
+    bad = [r["error"] for r in new if r["error"]]
+    st.session_state["search_log"] = slog
+    st.session_state["funnel_urls"] = len(hits)
+    st.session_state["notice"] = (
+        f"Search engines returned {len(hits)} URLs; {ok_n} pages read, {len(bad)} unreadable"
+        + (f" (e.g. {bad[0]})" if bad else "") + f"; {saved} saved to the local database."
+        + (" Open 'Search diagnostics' below to see why nothing came back." if not hits else ""))
     st.session_state.pop("outputs", None)
 
 for e in st.session_state.get("errors", []):
     st.warning(e)
 if st.session_state.get("notice"):
     st.info(st.session_state["notice"])
+if st.session_state.get("search_log"):
+    with st.expander("🔧 Search diagnostics (what each query returned)",
+                     expanded=st.session_state.get("funnel_urls", 1) == 0):
+        show_df(pd.DataFrame(st.session_state["search_log"]))
 
 # ---------------- working set
 all_recs = list(st.session_state.get("recs", {}).values())
@@ -1115,7 +1230,13 @@ with tab_res:
         m3.metric("Open", sum(r["status"] == "open" for r in shown))
         m4.metric("Closed", sum(r["status"] == "closed" for r in shown))
         if not shown:
-            st.info("Nothing matches the current filters - try loosening them (they apply instantly).")
+            n_nophd = sum(not r["has_phd"] for r in all_recs)
+            n_nokw = sum(not r["has_kw"] for r in all_recs)
+            n_closed = sum(r["status"] == "closed" for r in all_recs)
+            n_err = sum(bool(r["error"]) for r in all_recs)
+            st.info(f"Nothing matches the current filters (they apply instantly). Of {len(all_recs)} pages: "
+                    f"{n_nophd} lack PhD terms, {n_nokw} lack your keywords, {n_closed} look closed, "
+                    f"{n_err} could not be downloaded. Untick the matching filter(s) to see them.")
         else:
             pre = st.checkbox("Pre-tick all rows", value=True)
             df = pd.DataFrame([{
