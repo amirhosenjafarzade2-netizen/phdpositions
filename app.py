@@ -95,12 +95,34 @@ academic_sites = {
     ],
 }
 
+
+def build_dork(site, keyword, position, pdf_only=False, ignore_paths=False):
+    """Build a Google dork string for a single site."""
+    keyword = keyword.strip()
+    path = site["path"].strip("/")
+
+    if path and not ignore_paths:
+        parts = [f"site:{site['domain']}/{path}"]
+    else:
+        parts = [f"site:{site['domain']}"]
+
+    if keyword:
+        parts.append(f'"{keyword}"')
+    parts.append(position)
+
+    if pdf_only:
+        parts.append("filetype:pdf")
+
+    return " ".join(parts)
+
+
 st.title("🎓 Expanded PhD Meta-Search Dork Generator")
 st.markdown(
     "Generate targeted **Google Dorks** to search deep inside all major European academic portals, "
     "bypassing clutter and getting straight to indexable job listings."
 )
 
+# ---------------- Sidebar ----------------
 st.sidebar.header("Search Parameters")
 keyword_input = st.sidebar.text_input(
     "Research Keyword / Topic", value="reservoir"
@@ -112,9 +134,23 @@ selected_region = st.sidebar.selectbox(
     "Filter by Region", ["All Regions"] + list(academic_sites.keys())
 )
 
+pdf_only = st.sidebar.checkbox(
+    "📄 PDF format only",
+    value=False,
+    help="Adds filetype:pdf to every search, useful for vacancy announcements published as PDFs.",
+)
+if pdf_only:
+    st.sidebar.caption("✅ `filetype:pdf` will be added to all queries.")
+
+ignore_paths = st.sidebar.checkbox(
+    "🌐 Ignore site paths (domain only)",
+    value=False,
+    help="Searches the whole domain instead of the vacancy section. Helpful with PDFs, which are often stored in other folders.",
+)
+
 st.divider()
 
-# Main generator loop
+# ---------------- Main generator loop ----------------
 for region, sites in academic_sites.items():
     if selected_region != "All Regions" and selected_region != region:
         continue
@@ -122,13 +158,12 @@ for region, sites in academic_sites.items():
     st.subheader(f"🌍 Region: {region}")
 
     for site in sites:
-        # Construct the Google Dork query format
-        if site["path"]:
-            dork_query = f"site:{site['domain']}/{site['path']} \"{keyword_input}\" {position_type}"
-        else:
-            dork_query = f"site:{site['domain']} \"{keyword_input}\" {position_type}"
-
-        google_search_url = f"https://www.google.com/search?q={urllib.parse.quote(dork_query)}"
+        dork_query = build_dork(
+            site, keyword_input, position_type, pdf_only, ignore_paths
+        )
+        google_search_url = (
+            f"https://www.google.com/search?q={urllib.parse.quote_plus(dork_query)}"
+        )
 
         # Display layout
         col1, col2, col3 = st.columns([2, 5, 2])
@@ -141,12 +176,7 @@ for region, sites in academic_sites.items():
             st.code(dork_query, language="text")
 
         with col3:
-            st.markdown(
-                f"<br><a href='{google_search_url}' target='_blank'>"
-                f"<button style='background-color:#4CAF50; color:white; border:none; padding:8px 16px; "
-                f"border-radius:4px; cursor:pointer;'>Search Google 🔍</button></a>",
-                unsafe_allow_html=True,
-            )
+            st.link_button("Search Google 🔍", google_search_url)
 
     st.markdown("---")
 
