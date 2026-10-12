@@ -1,9 +1,1 @@
 streamlit
-requests
-beautifulsoup4
-python-dateutil
-pandas
-pypdf
-reportlab
-ddgs
-playwright
