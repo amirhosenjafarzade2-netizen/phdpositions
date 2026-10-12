@@ -6,16 +6,8 @@ st.set_page_config(
     page_title="PhD Search Dork Generator", page_icon="🎓", layout="wide"
 )
 
-# Categorized academic sites dictionary
+# Comprehensive categorized academic sites dictionary
 academic_sites = {
-    "Norway": [
-        {
-            "name": "Jobbnorge",
-            "domain": "jobbnorge.no",
-            "path": "en/available-jobs/joblisting/",
-        },
-        {"name": "NTNU", "domain": "ntnu.edu", "path": "vacancies/"},
-    ],
     "Netherlands": [
         {
             "name": "AcademicTransfer",
@@ -23,9 +15,70 @@ academic_sites = {
             "path": "en/jobs/",
         },
         {
-            "name": "EURAXESS Netherlands",
-            "domain": "euraxess.ec.europa.eu",
-            "path": "jobs/search",
+            "name": "Utrecht University",
+            "domain": "uu.nl",
+            "path": "en/organisation/working-at-utrecht-university/vacancies",
+        },
+        {
+            "name": "TU Delft",
+            "domain": "tudelft.nl",
+            "path": "en/about-tu-delft/working-at-tu-delft/vacancies",
+        },
+        {
+            "name": "Eindhoven University of Technology (TU/e)",
+            "domain": "tue.nl",
+            "path": "en/university/working-at-the-tue/vacancies",
+        },
+        {
+            "name": "Vrije Universiteit Amsterdam (VU)",
+            "domain": "vu.nl",
+            "path": "en/working-at-vu/vacancies",
+        },
+        {
+            "name": "University of Amsterdam (UvA)",
+            "domain": "uva.nl",
+            "path": "en/about-the-uva/working-at-the-uva/vacancies",
+        },
+    ],
+    "Norway": [
+        {
+            "name": "Jobbnorge (National Portal)",
+            "domain": "jobbnorge.no",
+            "path": "en/available-jobs/joblisting/",
+        },
+        {
+            "name": "NTNU (Trondheim/Gjøvik/Ålesund)",
+            "domain": "ntnu.edu",
+            "path": "vacancies/",
+        },
+        {
+            "name": "University of Oslo (UiO)",
+            "domain": "uio.no",
+            "path": "english/about/vacancies/",
+        },
+    ],
+    "Belgium": [
+        {
+            "name": "KU Leuven",
+            "domain": "kuleuven.be",
+            "path": "en/job-opportunities",
+        },
+        {
+            "name": "Ghent University",
+            "domain": "ugent.be",
+            "path": "en/job-opportunities",
+        },
+    ],
+    "France": [
+        {
+            "name": "CNRS",
+            "domain": "emploi.cnrs.fr",
+            "path": "",
+        },
+        {
+            "name": "ABG (Association Bernard Gregory)",
+            "domain": "abg.asso.fr",
+            "path": "en/candidat/offres",
         },
     ],
     "Pan-European / General": [
@@ -42,10 +95,10 @@ academic_sites = {
     ],
 }
 
-st.title("🎓 PhD Meta-Search Dork Generator")
+st.title("🎓 Expanded PhD Meta-Search Dork Generator")
 st.markdown(
-    "Instead of getting stuck in messy university navigation scrapers, use **Google Dorks** "
-    "to query deep inside target academic portals for specific research positions."
+    "Generate targeted **Google Dorks** to search deep inside all major European academic portals, "
+    "bypassing clutter and getting straight to indexable job listings."
 )
 
 st.sidebar.header("Search Parameters")
@@ -69,13 +122,15 @@ for region, sites in academic_sites.items():
     st.subheader(f"🌍 Region: {region}")
 
     for site in sites:
-        # Construct the Google Dork query format requested
-        dork_query = (
-            f"site:{site['domain']}/{site['path']} \"{keyword_input}\" {position_type}"
-        )
+        # Construct the Google Dork query format
+        if site["path"]:
+            dork_query = f"site:{site['domain']}/{site['path']} \"{keyword_input}\" {position_type}"
+        else:
+            dork_query = f"site:{site['domain']} \"{keyword_input}\" {position_type}"
+
         google_search_url = f"https://www.google.com/search?q={urllib.parse.quote(dork_query)}"
 
-        # Display using columns for a clean UI layout
+        # Display layout
         col1, col2, col3 = st.columns([2, 5, 2])
 
         with col1:
@@ -96,6 +151,6 @@ for region, sites in academic_sites.items():
     st.markdown("---")
 
 st.info(
-    "💡 **Tip:** Clicking 'Search Google' will open a pre-filled search query targeting "
-    "only indexable job listings and avoiding homepage menu noise."
+    "💡 **Tip:** Feel free to tweak the keyword sidebar (e.g., changing 'reservoir' to 'geothermal', 'flow assurance', or 'petroleum') "
+    "to instantly update all search queries across every country!"
 )
